@@ -1,0 +1,45 @@
+{
+  "name": "codex-coding-workflows",
+  "version": "0.1.0",
+  "description": "Add planning, task-loop discipline, adversarial verification, review-ready summaries, handoff summaries, and ship-readiness workflows to Codex.",
+  "author": {
+    "name": "OpenAI",
+    "email": "support@openai.com",
+    "url": "https://openai.com/"
+  },
+  "homepage": "https://openai.com/",
+  "repository": "https://openai.com/",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "workflow",
+    "planning",
+    "verification",
+    "shipping"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks.json",
+  "interface": {
+    "displayName": "Coding Workflows",
+    "shortDescription": "Plan, track, verify, and audit coding work",
+    "longDescription": "Use Codex Coding Workflows to add explicit planning, task-loop discipline, adversarial verification, review-ready and handoff summary artifacts, and ship-readiness audit skills to local coding sessions without claiming runtime features Codex core does not expose today.",
+    "developerName": "OpenAI",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://openai.com/",
+    "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
+    "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
+    "defaultPrompt": [
+      "Use $review-ready-summary to turn the current workflow state into a reviewer-facing summary.",
+      "Use $handoff-summary to generate a clean handoff from the current task, memory, and verification state.",
+      "Use $workflow-state-repair to repair malformed .codex-workflows state before relying on it."
+    ],
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/coding-workflows-small.svg",
+    "logo": "./assets/coding-workflows.svg",
+    "screenshots": []
+  }
+}

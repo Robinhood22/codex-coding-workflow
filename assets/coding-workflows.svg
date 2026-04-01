@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Coding Workflows logo">
+  <rect width="256" height="256" rx="48" fill="#0F766E"/>
+  <rect x="48" y="48" width="160" height="120" rx="24" fill="#CCFBF1"/>
+  <path d="M76 96h104M76 128h72M76 160h92" stroke="#0F766E" stroke-linecap="round" stroke-width="16"/>
+  <path d="M108 184h40l-20 24-20-24Z" fill="#99F6E4"/>
+</svg>

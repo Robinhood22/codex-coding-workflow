@@ -1,0 +1,6 @@
+interface:
+  display_name: "Review-Ready Summary"
+  short_description: "Generate a reviewer-facing workflow summary"
+  icon_small: "../../assets/coding-workflows-small.svg"
+  icon_large: "../../assets/coding-workflows.svg"
+  default_prompt: "Use $review-ready-summary to generate a reviewer-facing summary from the current workflow, verification, and ship-readiness state."

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+from analyze_change_scope import analyze_change_scope
+from branch_readiness import summarize_branch
+from verification_summary import build_verification_summary
+from workflow_state import (
+    ensure_state_files,
+    find_git_root,
+    find_workspace_root,
+    get_state_paths,
+    inspect_workflow_state,
+    parse_memory_sections,
+)
+
+
+REPORT_FILENAMES = {
+    "review-ready": "review-ready-summary.md",
+    "handoff": "handoff-summary.md",
+}
+
+
+def ensure_reports_dir(base_dir: Path) -> Path:
+    paths = ensure_state_files(base_dir)
+    reports_dir = paths["state_dir"] / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    gitkeep = reports_dir / ".gitkeep"
+    if not gitkeep.exists():
+        gitkeep.write_text("", encoding="utf-8")
+    return reports_dir
+
+
+def read_memory_sections(base_dir: Path) -> dict[str, list[str]]:
+    memory_path = get_state_paths(base_dir)["memory"]
+    if not memory_path.exists():
+        return {}
+    return parse_memory_sections(memory_path.read_text(encoding="utf-8"))
+
+
+def summarize_branch_state(base_dir: Path) -> dict[str, Any] | None:
+    repo_root = find_git_root(base_dir)
+    if repo_root is None:
+        return None
+    return summarize_branch(repo_root)
+
+
+def flatten_blockers(items: list[str]) -> list[str]:
+    return [item for item in items if item]
+
+
+def build_next_actions(
+    change_scope: dict[str, Any],
+    verification_summary: dict[str, Any],
+    branch_summary: dict[str, Any] | None,
+) -> list[str]:
+    actions: list[str] = []
+    if change_scope.get("state_repair_needed"):
+        actions.append("Run workflow-state-repair before relying on repo-local workflow state.")
+    if change_scope.get("task_loop_status") in {"missing", "stale", "invalid"}:
+        actions.append("Refresh the active task loop so it matches the current implementation.")
+    if verification_summary.get("status") in {"missing", "stale", "invalid"}:
+        actions.append("Run verify-change or refresh verification evidence before review or handoff.")
+    if branch_summary and branch_summary.get("upstream") is None:
+        actions.append("Set an upstream branch before treating this as ready to land.")
+    if not actions:
+        actions.append("No immediate workflow blockers detected from plugin state alone.")
+    return actions
+
+
+def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
+    workspace_root = find_workspace_root(base_dir)
+    state = inspect_workflow_state(base_dir)
+    change_scope = analyze_change_scope(base_dir)
+    verification = build_verification_summary(base_dir)
+    branch_summary = summarize_branch_state(base_dir)
+    next_actions = build_next_actions(change_scope, verification, branch_summary)
+
+    lines = [
+        "# Review-Ready Summary",
+        "",
+        f"Workspace: `{workspace_root}`",
+        "",
+        "## Status",
+        f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
+        f"- Task loop: {state['task_loop']['status']}",
+        f"- Verification: {verification['status']}",
+        f"- Memory: {state['memory']['status']}",
+        f"- Policy: {state['policy']['status']}",
+        "",
+        "## Change Scope",
+        f"- Changed files: {change_scope.get('changed_file_count', 0)}",
+        f"- Changed lines: {change_scope.get('total_changed_lines', 0)}",
+    ]
+
+    changed_files = change_scope.get("changed_files", [])
+    if changed_files:
+        lines.append("- Files:")
+        lines.extend([f"  - `{path}`" for path in changed_files])
+
+    lines.extend(
+        [
+            "",
+            "## Verification",
+            f"- Latest verdict: {verification.get('latest_verdict') or 'none'}",
+            f"- Latest timestamp: {verification.get('latest_timestamp') or 'none'}",
+            f"- Valid entries: {verification.get('entry_count', 0)}",
+            f"- Invalid lines: {verification.get('invalid_lines', 0)}",
+        ]
+    )
+    if verification.get("blockers"):
+        lines.append("- Verification blockers:")
+        lines.extend([f"  - {item}" for item in verification["blockers"]])
+
+    lines.extend(["", "## Blockers"])
+    blockers = branch_summary["blockers"] if branch_summary else ["No git repository detected."]
+    lines.extend([f"- {blocker}" for blocker in blockers])
+
+    lines.extend(["", "## Recommended Next Actions"])
+    lines.extend([f"- {action}" for action in next_actions])
+    lines.append("")
+
+    report = "\n".join(lines)
+    metadata = {
+        "mode": "review-ready",
+        "workspace_root": str(workspace_root),
+        "state": state,
+        "change_scope": change_scope,
+        "verification": verification,
+        "branch_summary": branch_summary,
+        "next_actions": next_actions,
+    }
+    return report, metadata
+
+
+def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
+    workspace_root = find_workspace_root(base_dir)
+    state = inspect_workflow_state(base_dir)
+    change_scope = analyze_change_scope(base_dir)
+    verification = build_verification_summary(base_dir)
+    branch_summary = summarize_branch_state(base_dir)
+    memory_sections = read_memory_sections(base_dir)
+    next_actions = build_next_actions(change_scope, verification, branch_summary)
+
+    stable_facts = memory_sections.get("Stable Facts", [])
+    constraints = memory_sections.get("Constraints", [])
+    open_questions = memory_sections.get("Open Questions", [])
+
+    lines = [
+        "# Handoff Summary",
+        "",
+        f"Workspace: `{workspace_root}`",
+        "",
+        "## What Changed",
+        f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
+        f"- Changed files: {change_scope.get('changed_file_count', 0)}",
+    ]
+    changed_files = change_scope.get("changed_files", [])
+    if changed_files:
+        lines.extend([f"- `{path}`" for path in changed_files])
+
+    lines.extend(
+        [
+            "",
+            "## What Is Verified",
+            f"- Verification state: {verification['status']}",
+            f"- Latest verdict: {verification.get('latest_verdict') or 'none'}",
+            f"- Latest timestamp: {verification.get('latest_timestamp') or 'none'}",
+        ]
+    )
+    if verification.get("blockers"):
+        lines.append("- Verification blockers:")
+        lines.extend([f"  - {item}" for item in verification["blockers"]])
+
+    lines.extend(["", "## What Is Still Open"])
+    open_items = flatten_blockers(
+        (branch_summary["blockers"] if branch_summary else [])
+        + state["task_loop"].get("reasons", [])
+    )
+    if open_items:
+        lines.extend([f"- {item}" for item in open_items])
+    else:
+        lines.append("- No workflow blockers detected from plugin state alone.")
+
+    lines.extend(["", "## Stable Facts"])
+    lines.extend(stable_facts or ["- No stable facts recorded."])
+
+    lines.extend(["", "## Constraints"])
+    lines.extend(constraints or ["- No durable constraints recorded."])
+
+    lines.extend(["", "## Open Questions"])
+    lines.extend(open_questions or ["- None."])
+
+    lines.extend(["", "## Next Actions For The Next Person"])
+    lines.extend([f"- {action}" for action in next_actions])
+    lines.append("")
+
+    report = "\n".join(lines)
+    metadata = {
+        "mode": "handoff",
+        "workspace_root": str(workspace_root),
+        "state": state,
+        "change_scope": change_scope,
+        "verification": verification,
+        "branch_summary": branch_summary,
+        "memory_sections": memory_sections,
+        "next_actions": next_actions,
+    }
+    return report, metadata
+
+
+def write_report(base_dir: Path, mode: str) -> dict[str, Any]:
+    reports_dir = ensure_reports_dir(base_dir)
+    if mode == "review-ready":
+        report_text, metadata = build_review_ready_report(base_dir)
+    elif mode == "handoff":
+        report_text, metadata = build_handoff_report(base_dir)
+    else:
+        raise SystemExit(f"Unsupported mode: {mode}")
+
+    output_path = reports_dir / REPORT_FILENAMES[mode]
+    output_path.write_text(report_text, encoding="utf-8")
+    return {
+        "mode": mode,
+        "path": str(output_path),
+        "workspace_root": metadata["workspace_root"],
+        "metadata": metadata,
+    }
+
+
+def render_text(result: dict[str, Any]) -> str:
+    lines = [
+        f"Report mode: {result['mode']}",
+        f"Report path: {result['path']}",
+    ]
+    next_actions = result["metadata"].get("next_actions", [])
+    if next_actions:
+        lines.append("Next actions:")
+        lines.extend([f"- {action}" for action in next_actions])
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate review-ready or handoff workflow reports.")
+    parser.add_argument("--repo", type=str, default=".", help="Repository or workspace path.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=sorted(REPORT_FILENAMES.keys()),
+        help="Report mode to generate.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
+    args = parser.parse_args()
+
+    result = write_report(Path(args.repo).expanduser(), args.mode)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_text(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
