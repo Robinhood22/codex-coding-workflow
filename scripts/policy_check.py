@@ -23,7 +23,7 @@ def build_policy_review(base_dir: Path, intent: str) -> dict[str, Any]:
     if scope.get("memory_refresh_needed"):
         next_skills.append("project-memory-sync")
     if risk_level in {"medium", "high"}:
-        next_skills.append("risk-review")
+        next_skills.append("policy-risk-check")
     if verification_required:
         next_skills.append("verify-change")
     if intent == "ship":
