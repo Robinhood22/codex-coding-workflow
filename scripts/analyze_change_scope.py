@@ -186,7 +186,7 @@ def determine_recommended_skills(
     if memory_refresh_needed:
         skills.append("project-memory-sync")
     if risk_level in {"medium", "high"}:
-        skills.append("risk-review")
+        skills.append("policy-risk-check")
     if verification_recommended:
         skills.append("verify-change")
     return skills

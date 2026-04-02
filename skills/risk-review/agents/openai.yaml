@@ -1,6 +1,0 @@
-interface:
-  display_name: "Risk Review"
-  short_description: "Classify workflow risk and next actions"
-  icon_small: "../../assets/coding-workflows-small.svg"
-  icon_large: "../../assets/coding-workflows.svg"
-  default_prompt: "Use $risk-review to classify this change as low, medium, or high risk and recommend the right next workflow step."

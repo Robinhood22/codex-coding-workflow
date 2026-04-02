@@ -1,0 +1,6 @@
+interface:
+  display_name: "Risk Classification"
+  short_description: "Classify delivery risk from policy"
+  icon_small: "../../assets/coding-workflows-small.svg"
+  icon_large: "../../assets/coding-workflows.svg"
+  default_prompt: "Use $policy-risk-check when the user explicitly asks for a low, medium, or high risk call or a policy-driven verification recommendation."
