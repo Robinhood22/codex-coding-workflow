@@ -33,7 +33,7 @@ py -3 "./plugins/codex-coding-workflows/scripts/policy_check.py" --intent ship -
 
 3. Interpret the obvious blockers by category.
    - git state: dirty working tree, no upstream branch, branch behind upstream, or nothing to ship
-   - workflow state: missing, stale, or invalid task loop and malformed state files
+   - workflow state: missing, stale, or invalid task loop or task streams and malformed state files
    - verification evidence: missing, stale, or invalid verification logs
    - release readiness: missing validation, missing review artifact, or unresolved risky gaps
 4. Inspect the actual change scope.

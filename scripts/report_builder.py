@@ -62,7 +62,9 @@ def build_next_actions(
     if change_scope.get("state_repair_needed"):
         actions.append("Run workflow-state-repair before relying on repo-local workflow state.")
     if change_scope.get("task_loop_status") in {"missing", "stale", "invalid"}:
-        actions.append("Refresh the active task loop so it matches the current implementation.")
+        actions.append(
+            "Refresh the active task loop or task streams so they match the current implementation."
+        )
     if verification_summary.get("status") in {"missing", "stale", "invalid"}:
         actions.append("Run verify-change or refresh verification evidence before review or handoff.")
     if branch_summary and branch_summary.get("upstream") is None:
@@ -87,7 +89,7 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         "",
         "## Status",
         f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
-        f"- Task loop: {state['task_loop']['status']}",
+        f"- Task loop: {state['task_loop']['status']} ({state['task_loop'].get('mode', 'legacy')})",
         f"- Verification: {verification['status']}",
         f"- Memory: {state['memory']['status']}",
         f"- Policy: {state['policy']['status']}",
@@ -96,6 +98,12 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         f"- Changed files: {change_scope.get('changed_file_count', 0)}",
         f"- Changed lines: {change_scope.get('total_changed_lines', 0)}",
     ]
+    if state["task_loop"].get("mode") == "streams":
+        lines.append(
+            f"- Streams: {state['task_loop'].get('stream_count', 0)} total, "
+            f"{state['task_loop'].get('open_stream_count', 0)} open, "
+            f"primary={state['task_loop'].get('primary_stream_id') or 'none'}"
+        )
 
     changed_files = change_scope.get("changed_files", [])
     if changed_files:
@@ -159,6 +167,12 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
         f"- Changed files: {change_scope.get('changed_file_count', 0)}",
     ]
+    if state["task_loop"].get("mode") == "streams":
+        lines.append(
+            f"- Task streams: {state['task_loop'].get('stream_count', 0)} total, "
+            f"{state['task_loop'].get('open_stream_count', 0)} open, "
+            f"primary={state['task_loop'].get('primary_stream_id') or 'none'}"
+        )
     changed_files = change_scope.get("changed_files", [])
     if changed_files:
         lines.extend([f"- `{path}`" for path in changed_files])

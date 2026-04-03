@@ -8,18 +8,20 @@ from typing import Any
 
 from workflow_state import (
     find_workspace_root,
-    get_task_loop_status,
+    get_latest_verification_entry,
+    get_task_state,
     get_verification_state,
     load_verification_entries,
+    parse_timestamp,
 )
 
 
 def build_verification_summary(base_dir: Path) -> dict[str, Any]:
     workspace_root = find_workspace_root(base_dir)
-    task_loop = get_task_loop_status(base_dir)
-    verification = get_verification_state(base_dir, task_loop)
+    task_state = get_task_state(base_dir)
+    verification = get_verification_state(base_dir, task_state)
     loaded = load_verification_entries(base_dir)
-    latest_entry = loaded["entries"][-1] if loaded["entries"] else None
+    latest_entry = get_latest_verification_entry(loaded["entries"])
     checks = latest_entry.get("checks", []) if latest_entry else []
 
     failing_checks = []
@@ -36,6 +38,34 @@ def build_verification_summary(base_dir: Path) -> dict[str, Any]:
                 }
             )
 
+    stream_coverage: list[dict[str, Any]] = []
+    for stream in task_state.get("streams", []):
+        latest_stream_entry = get_latest_verification_entry(
+            loaded["entries"],
+            stream_id=stream["id"],
+        )
+        latest_stream_timestamp = (latest_stream_entry or {}).get("timestamp")
+        latest_stream_dt = parse_timestamp(str(latest_stream_timestamp)) if latest_stream_timestamp else None
+        stream_updated_dt = parse_timestamp(stream.get("updated_at"))
+        covered = (
+            stream["state"] != "open"
+            or stream["status"] in {"healthy", "stale"}
+            and stream_updated_dt is not None
+            and latest_stream_dt is not None
+            and latest_stream_dt >= stream_updated_dt
+        )
+        if stream["state"] != "open":
+            covered = True
+        stream_coverage.append(
+            {
+                "id": stream["id"],
+                "state": stream["state"],
+                "status": stream["status"],
+                "latest_timestamp": latest_stream_timestamp,
+                "covered": covered,
+            }
+        )
+
     blockers: list[str] = []
     if verification["status"] == "missing":
         blockers.append("No verification evidence is logged.")
@@ -45,10 +75,15 @@ def build_verification_summary(base_dir: Path) -> dict[str, Any]:
         blockers.append("Verification log contains malformed entries.")
     if latest_entry and str(latest_entry.get("verdict", "")).upper() == "FAIL":
         blockers.append("Latest verification verdict is FAIL.")
+    for stream in stream_coverage:
+        if stream["state"] == "open" and not stream["covered"]:
+            blockers.append(f"Task stream {stream['id']} is missing current verification coverage.")
 
     return {
         "workspace_root": str(workspace_root),
-        "task_loop_status": task_loop["status"],
+        "task_loop_status": task_state["status"],
+        "task_state_mode": task_state.get("mode", "legacy"),
+        "task_stream_count": task_state.get("stream_count", 0),
         "status": verification["status"],
         "entry_count": verification["entry_count"],
         "invalid_lines": verification["invalid_lines"],
@@ -57,6 +92,7 @@ def build_verification_summary(base_dir: Path) -> dict[str, Any]:
         "latest_checks_count": len(checks),
         "failing_checks": failing_checks,
         "covers_current_task_loop": verification["status"] == "present",
+        "stream_coverage": stream_coverage,
         "blockers": blockers,
     }
 
@@ -69,7 +105,14 @@ def render_text(summary: dict[str, Any]) -> str:
         f"Valid entries: {summary['entry_count']}",
         f"Invalid lines: {summary['invalid_lines']}",
         f"Task-loop coverage: {'yes' if summary['covers_current_task_loop'] else 'no'}",
+        f"Task mode: {summary.get('task_state_mode', 'legacy')}",
     ]
+    if summary.get("stream_coverage"):
+        lines.append("Stream coverage:")
+        lines.extend(
+            f"- {stream['id']}: {'covered' if stream['covered'] else 'stale/missing'}"
+            for stream in summary["stream_coverage"]
+        )
     if summary["failing_checks"]:
         lines.append("Failing checks:")
         lines.extend(

@@ -20,6 +20,8 @@ def run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
 def parse_status(status_output: str) -> dict[str, Any]:
     changed_files: list[str] = []
     staged = 0
@@ -84,6 +86,7 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     verification_summary = build_verification_summary(repo_root)
 
     task_loop_status = change_scope.get("task_loop_status", "missing")
+    task_state_mode = change_scope.get("task_state_mode", "legacy")
     if task_loop_status == "healthy":
         workflow_state = "healthy"
     elif task_loop_status == "stale":
@@ -108,11 +111,11 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     if ahead == 0 and not status["changed_files"]:
         blockers.append("No local changes or commits are ahead of upstream.")
     if workflow_state == "missing_task_loop" and change_scope.get("changed_file_count", 0) > 0:
-        blockers.append("Workflow task loop is missing for active work.")
+        blockers.append("Workflow task loop or task streams are missing for active work.")
     if workflow_state == "invalid_task_loop":
-        blockers.append("Workflow task loop is invalid.")
+        blockers.append("Workflow task loop or task streams are invalid.")
     if workflow_state == "stale_task_loop":
-        blockers.append("Workflow task loop is stale or invalid.")
+        blockers.append("Workflow task loop or task streams are stale or invalid.")
     if verification_state == "missing" and risk_level in {"medium", "high"}:
         blockers.append("No verification evidence is logged for a medium/high-risk change.")
     if verification_state == "stale":
@@ -140,6 +143,10 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         "recent_commits": recent_log,
         "risk_level": risk_level,
         "workflow_state": workflow_state,
+        "task_state_mode": task_state_mode,
+        "task_stream_count": change_scope.get("task_stream_count", 0),
+        "open_task_stream_count": change_scope.get("open_task_stream_count", 0),
+        "primary_stream_id": change_scope.get("primary_stream_id"),
         "verification_state": verification_state,
         "memory_state": memory_status,
         "policy_state": policy_status,
@@ -163,12 +170,20 @@ def render_text(summary: dict[str, Any]) -> str:
         f"{summary['staged_count']} staged, "
         f"{summary['unstaged_count']} unstaged, "
         f"{summary['untracked_count']} untracked",
-        f"Workflow state: {summary.get('workflow_state', 'unknown')}",
+        "Workflow state: "
+        f"{summary.get('workflow_state', 'unknown')} ({summary.get('task_state_mode', 'legacy')})",
         f"Verification state: {summary.get('verification_state', 'unknown')}",
         f"Memory state: {summary.get('memory_state', 'unknown')}",
         f"Policy state: {summary.get('policy_state', 'unknown')}",
         f"Risk level: {summary.get('risk_level', 'unknown')}",
     ]
+    if summary.get("task_state_mode") == "streams":
+        lines.append(
+            "Streams: "
+            f"{summary.get('task_stream_count', 0)} total, "
+            f"{summary.get('open_task_stream_count', 0)} open, "
+            f"primary={summary.get('primary_stream_id') or 'none'}"
+        )
 
     if summary["blockers"]:
         lines.append("Blockers:")

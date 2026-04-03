@@ -26,7 +26,7 @@ Route to one of these specialist workflows:
 
 Keep the plugin orchestration-focused. Reuse Codex's existing tools and built-in skills instead of recreating their behavior inside this plugin.
 
-Repo-local shared state lives in `.codex-workflows/`. Treat it as the source of truth for workflow memory, the active task loop, and verification evidence.
+Repo-local shared state lives in `.codex-workflows/`. Treat it as the source of truth for workflow memory, the active task loop or task streams, and verification evidence.
 
 ## Operating Rules
 

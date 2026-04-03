@@ -11,10 +11,14 @@ from workflow_state import (
     ensure_state_files,
     get_state_paths,
     inspect_workflow_state,
+    load_task_stream_index,
     load_verification_entries,
     normalize_memory_text,
     normalize_task_loop_text,
+    normalize_task_stream_text,
     serialize_policy,
+    serialize_task_stream_index,
+    write_task_state_summary,
 )
 
 
@@ -79,15 +83,64 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
         repaired.append("policy")
 
     task_status = before["files"]["task_loop"]["status"]
+    task_mode = before["files"]["task_loop"].get("mode", "legacy")
     if task_status in {"invalid", "stale"}:
-        backup_path = backup_state_file(base_dir, paths["task_loop"])
-        if backup_path:
-            backups.append(backup_path)
-        current = paths["task_loop"].read_text(encoding="utf-8") if paths["task_loop"].exists() else ""
-        paths["task_loop"].write_text(normalize_task_loop_text(current), encoding="utf-8")
-        repaired.append("task_loop")
-        if task_status == "stale":
-            manual_review_required.append("task_loop")
+        if task_mode == "streams":
+            summary_backup = backup_state_file(base_dir, paths["task_loop"])
+            if summary_backup:
+                backups.append(summary_backup)
+
+            index_info = load_task_stream_index(base_dir)
+            stream_changed = False
+            if index_info["status"] == "invalid":
+                if index_info["data"] and index_info["data"].get("streams"):
+                    backup_path = backup_state_file(base_dir, paths["task_stream_index"])
+                    if backup_path:
+                        backups.append(backup_path)
+                    paths["task_stream_index"].parent.mkdir(parents=True, exist_ok=True)
+                    paths["task_stream_index"].write_text(
+                        serialize_task_stream_index(index_info["data"]),
+                        encoding="utf-8",
+                    )
+                    stream_changed = True
+                else:
+                    manual_review_required.append("task_loop")
+            for stream in before["files"]["task_loop"].get("streams", []):
+                if stream["status"] not in {"invalid", "stale"}:
+                    continue
+                stream_path = Path(stream["path"])
+                if not stream_path.exists():
+                    manual_review_required.append("task_loop")
+                    continue
+                backup_path = backup_state_file(base_dir, stream_path)
+                if backup_path:
+                    backups.append(backup_path)
+                current = stream_path.read_text(encoding="utf-8")
+                stream_path.write_text(
+                    normalize_task_stream_text(
+                        current,
+                        stream_id=stream["id"],
+                        title=stream["title"],
+                        state=stream["state"],
+                    ),
+                    encoding="utf-8",
+                )
+                stream_changed = True
+
+            if stream_changed:
+                write_task_state_summary(base_dir)
+                repaired.append("task_loop")
+            if task_status == "stale":
+                manual_review_required.append("task_loop")
+        else:
+            backup_path = backup_state_file(base_dir, paths["task_loop"])
+            if backup_path:
+                backups.append(backup_path)
+            current = paths["task_loop"].read_text(encoding="utf-8") if paths["task_loop"].exists() else ""
+            paths["task_loop"].write_text(normalize_task_loop_text(current), encoding="utf-8")
+            repaired.append("task_loop")
+            if task_status == "stale":
+                manual_review_required.append("task_loop")
 
     verification_loaded = load_verification_entries(base_dir)
     if verification_loaded["invalid_lines"] > 0:

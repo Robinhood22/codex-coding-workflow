@@ -31,7 +31,7 @@ This is a planning-only skill. Stay read-only while it is active. Do not start i
    - Leave no important decisions to the implementer.
    - Name important defaults and assumptions instead of letting them stay implicit.
 4. Seed workflow state when helpful.
-   - If the task is clearly multi-step, prepare or refresh `.codex-workflows/active-task-loop.md`.
+   - If the task is clearly multi-step, prepare or refresh `.codex-workflows/active-task-loop.md` or the relevant files under `.codex-workflows/task-streams/`.
    - Record only durable constraints or decisions in `.codex-workflows/memory.md`.
 5. End with an implementation-ready plan.
    - Include a concise summary.

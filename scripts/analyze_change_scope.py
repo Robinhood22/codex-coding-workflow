@@ -13,7 +13,7 @@ from workflow_state import (
     find_git_root,
     find_workspace_root,
     get_memory_status,
-    get_task_loop_status,
+    get_task_state,
     get_verification_state,
     is_workflow_state_path,
     load_policy,
@@ -197,12 +197,12 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     policy_info = load_policy(base_dir)
     policy = policy_info["data"]
     memory = get_memory_status(base_dir)
-    task_loop = get_task_loop_status(base_dir, policy)
-    verification = get_verification_state(base_dir, task_loop)
+    task_state = get_task_state(base_dir, policy)
+    verification = get_verification_state(base_dir, task_state)
     needs_state_repair = (
         memory["status"] == "invalid"
         or policy_info["status"] == "invalid"
-        or task_loop["status"] == "invalid"
+        or task_state["status"] == "invalid"
         or verification["status"] == "invalid"
     )
     repo_root = find_git_root(base_dir)
@@ -210,7 +210,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         recommended_skills = determine_recommended_skills(
             needs_state_repair=needs_state_repair,
             task_loop_needed=False,
-            task_loop_stale=task_loop["stale"],
+            task_loop_stale=task_state["stale"],
             memory_refresh_needed=False,
             verification_recommended=False,
             risk_level="low",
@@ -229,8 +229,12 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
             "memory_status": memory["status"],
             "memory_refresh_needed": False,
             "policy_status": policy_info["status"],
-            "task_loop_status": task_loop["status"],
-            "task_loop_stale": task_loop["stale"],
+            "task_loop_status": task_state["status"],
+            "task_loop_stale": task_state["stale"],
+            "task_state_mode": task_state.get("mode", "legacy"),
+            "task_stream_count": task_state.get("stream_count", 0),
+            "open_task_stream_count": task_state.get("open_stream_count", 0),
+            "primary_stream_id": task_state.get("primary_stream_id"),
             "verification_state": verification["status"],
             "verification_log_present": verification["entry_count"] > 0,
             "state_repair_needed": needs_state_repair,
@@ -275,7 +279,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     verification_recommended = verification_required_for(risk_level, policy) or (
         total_changed_lines >= int(policy["verification"]["changed_lines_threshold"])
     )
-    task_loop_stale = task_loop["status"] in {"stale", "invalid"}
+    task_loop_stale = task_state["status"] in {"stale", "invalid"}
     recommended_skills = determine_recommended_skills(
         needs_state_repair=needs_state_repair,
         task_loop_needed=task_loop_needed,
@@ -301,8 +305,12 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         "memory_status": memory["status"],
         "memory_refresh_needed": memory_refresh_needed,
         "policy_status": policy_info["status"],
-        "task_loop_status": task_loop["status"],
+        "task_loop_status": task_state["status"],
         "task_loop_stale": task_loop_stale,
+        "task_state_mode": task_state.get("mode", "legacy"),
+        "task_stream_count": task_state.get("stream_count", 0),
+        "open_task_stream_count": task_state.get("open_stream_count", 0),
+        "primary_stream_id": task_state.get("primary_stream_id"),
         "verification_state": verification["status"],
         "verification_log_present": verification["entry_count"] > 0,
         "state_repair_needed": needs_state_repair,
@@ -330,7 +338,7 @@ def render_summary(result: dict[str, Any]) -> str:
         "Changed lines: {lines} (+{added}/-{removed})\n"
         "Categories: {categories}\n"
         "Risk: {risk}\n"
-        "Task loop: {task_loop}\n"
+        "Task loop: {task_loop} ({task_mode})\n"
         "Verification log: {verification}"
     ).format(
         count=result["changed_file_count"],
@@ -340,6 +348,7 @@ def render_summary(result: dict[str, Any]) -> str:
         categories=category_summary,
         risk=result["risk_level"],
         task_loop=result.get("task_loop_status", "unknown"),
+        task_mode=result.get("task_state_mode", "legacy"),
         verification=result.get("verification_state", "unknown"),
     )
 
@@ -355,13 +364,13 @@ def render_hook_message(result: dict[str, Any]) -> str:
     if result["task_loop_needed"]:
         reminders.append(
             "[codex-coding-workflows] Multi-file change detected "
-            f"({count} files, {lines} changed lines). Refresh the task loop so it still "
-            "matches the real implementation steps and current scope."
+            f"({count} files, {lines} changed lines). Refresh the task loop or task streams "
+            "so they still match the real implementation steps and current scope."
         )
     elif result["task_loop_stale"]:
         reminders.append(
-            "[codex-coding-workflows] The repo-local task loop looks stale or invalid. "
-            "Refresh it so the active step matches the current implementation."
+            "[codex-coding-workflows] The repo-local task loop or task streams look stale "
+            "or invalid. Refresh them so the active work matches the current implementation."
         )
 
     if result["state_repair_needed"]:

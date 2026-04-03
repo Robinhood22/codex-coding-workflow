@@ -12,7 +12,7 @@ Use this skill when repo-local workflow state cannot be trusted. It checks
 creating backups first.
 
 This skill repairs structure, not truth. It can normalize malformed files and preserve
-what is salvageable, but it cannot invent a trustworthy task loop, real verification
+what is salvageable, but it cannot invent a trustworthy task loop, task stream, real verification
 evidence, or durable facts that were never recorded.
 
 ## Workflow
@@ -31,7 +31,7 @@ py -3 "./plugins/codex-coding-workflows/scripts/state_doctor.py" --repair --json
 
 3. Explain what was repaired versus what still needs human review.
    - malformed memory or policy files can be normalized automatically
-   - malformed task loops can be normalized, but stale task content may still need review
+   - malformed task loops or task streams can be normalized, but stale task content may still need review
    - malformed verification logs can be cleaned, but missing or stale evidence still requires a real verify run
 
 ## Guardrails
