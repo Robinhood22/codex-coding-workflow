@@ -14,6 +14,7 @@ from workflow_state import (
     ensure_state_files,
     find_git_root,
     find_workspace_root,
+    get_default_section_lines,
     get_state_paths,
     inspect_workflow_state,
     parse_timestamp,
@@ -53,6 +54,11 @@ def summarize_branch_state(base_dir: Path) -> dict[str, Any] | None:
 
 def flatten_blockers(items: list[str]) -> list[str]:
     return [item for item in items if item]
+
+
+def filter_real_memory_lines(section_name: str, lines: list[str]) -> list[str]:
+    defaults = set(get_default_section_lines(section_name))
+    return [line for line in lines if line.strip() and line.strip() not in defaults]
 
 
 def summarize_latest_team_run(base_dir: Path) -> dict[str, Any] | None:
@@ -109,6 +115,8 @@ def build_next_actions(
         actions.append("Run project-memory-sync auto-refresh to promote queued memory candidates.")
     if state.get("memory_sync", {}).get("status") == "invalid":
         actions.append("Repair the memory sync log before trusting automatic/shared memory state.")
+    if state.get("buglog", {}).get("status") == "invalid":
+        actions.append("Repair bug memory before relying on historical bug-fix recall.")
     if change_scope.get("task_loop_status") in {"missing", "stale", "invalid"}:
         actions.append("Refresh the active task loop so it matches the current implementation.")
     if verification_summary.get("status") in {"missing", "stale", "invalid"}:
@@ -233,6 +241,14 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
     stable_facts = memory_sections.get("Stable Facts", [])
     constraints = memory_sections.get("Constraints", [])
     open_questions = memory_sections.get("Open Questions", [])
+    do_not_repeat = filter_real_memory_lines(
+        "Do-Not-Repeat",
+        memory_sections.get("Do-Not-Repeat", []),
+    )
+    decision_log = filter_real_memory_lines(
+        "Decision Log",
+        memory_sections.get("Decision Log", []),
+    )
 
     lines = [
         "# Handoff Summary",
@@ -291,6 +307,14 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
 
     lines.extend(["", "## Constraints"])
     lines.extend(constraints or ["- No durable constraints recorded."])
+
+    if do_not_repeat:
+        lines.extend(["", "## Do-Not-Repeat"])
+        lines.extend(do_not_repeat)
+
+    if decision_log:
+        lines.extend(["", "## Recent Decision Log"])
+        lines.extend(decision_log[-3:])
 
     lines.extend(["", "## Open Questions"])
     lines.extend(open_questions or ["- None."])

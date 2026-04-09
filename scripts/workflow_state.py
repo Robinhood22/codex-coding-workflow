@@ -14,17 +14,23 @@ from typing import Any
 STATE_DIRNAME = ".codex-workflows"
 BACKUPS_DIRNAME = "backups"
 SCHEMA_VERSION = 3
-MEMORY_SECTIONS = (
+REQUIRED_MEMORY_SECTIONS = (
     "Stable Facts",
     "Preferences",
     "Constraints",
     "Open Questions",
 )
+OPTIONAL_MEMORY_SECTIONS = (
+    "Do-Not-Repeat",
+    "Decision Log",
+)
+MEMORY_SECTIONS = REQUIRED_MEMORY_SECTIONS + OPTIONAL_MEMORY_SECTIONS
 MEMORY_SCOPES = {"local", "shared"}
 SHARED_MEMORY_PREFIX = "[shared]"
 VERIFICATION_REQUIRED_KEYS = ("timestamp", "scope", "checks", "verdict")
 VALID_VERDICTS = {"PASS", "FAIL", "PARTIAL"}
 MEMORY_CANDIDATE_REQUIRED_KEYS = ("scope", "section", "text", "source")
+BUGLOG_REQUIRED_KEYS = ("timestamp", "file", "symptom", "root_cause", "fix", "tags", "source")
 
 SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("anthropic-api-key", r"\bsk-ant-(?:api|admin)[a-zA-Z0-9_\-]{20,}\b"),
@@ -152,6 +158,7 @@ def get_state_paths(base_dir: Path) -> dict[str, Path]:
     return {
         "state_dir": state_dir,
         "backups_dir": state_dir / BACKUPS_DIRNAME,
+        "state_gitignore": state_dir / ".gitignore",
         "readme": state_dir / "README.md",
         "memory": state_dir / "memory.md",
         "shared_memory": state_dir / "shared-memory.md",
@@ -159,7 +166,10 @@ def get_state_paths(base_dir: Path) -> dict[str, Path]:
         "memory_sync_log": state_dir / "memory-sync-log.jsonl",
         "task_loop": state_dir / "active-task-loop.md",
         "verification_log": state_dir / "verification-log.jsonl",
+        "buglog": state_dir / "buglog.jsonl",
         "policy": state_dir / "policy.json",
+        "runtime_dir": state_dir / "runtime",
+        "hook_state": state_dir / "runtime" / "hook-state.json",
     }
 
 
@@ -169,6 +179,8 @@ def default_memory_sections() -> dict[str, list[str]]:
         "Preferences": ["- No explicit workflow preferences recorded yet."],
         "Constraints": ["- No durable constraints recorded yet."],
         "Open Questions": ["- None."],
+        "Do-Not-Repeat": ["- No repeated pitfalls recorded yet."],
+        "Decision Log": ["- No durable decisions recorded yet."],
     }
 
 
@@ -211,10 +223,12 @@ def default_readme_text() -> str:
         "This directory stores repo-local workflow state for the "
         "`codex-coding-workflows` plugin.\n\n"
         "Local memory lives in `memory.md`, shared memory lives in `shared-memory.md`, "
-        "pending automatic memory promotions live in `memory-candidates.jsonl`, and "
-        "sync history lives in `memory-sync-log.jsonl`.\n\n"
+        "pending automatic memory promotions live in `memory-candidates.jsonl`, sync "
+        "history lives in `memory-sync-log.jsonl`, and confirmed bug-fix recall lives "
+        "in `buglog.jsonl`.\n\n"
         "The `backups/` directory stores repair-time snapshots before malformed "
-        "workflow files are rewritten.\n"
+        "workflow files are rewritten. Runtime-only hook data lives under `runtime/` "
+        "and is ignored via `.codex-workflows/.gitignore`.\n"
     )
 
 
@@ -229,6 +243,7 @@ def ensure_state_files(base_dir: Path) -> dict[str, Path]:
     paths["backups_dir"].mkdir(parents=True, exist_ok=True)
 
     defaults = {
+        "state_gitignore": "runtime/\n",
         "readme": default_readme_text(),
         "memory": default_memory_text(),
         "shared_memory": default_shared_memory_text(),
@@ -236,6 +251,7 @@ def ensure_state_files(base_dir: Path) -> dict[str, Path]:
         "memory_sync_log": "",
         "task_loop": default_task_loop_text(),
         "verification_log": "",
+        "buglog": "",
         "policy": serialize_policy(DEFAULT_POLICY),
     }
     for key, text in defaults.items():
@@ -347,22 +363,29 @@ def get_memory_file_status(path: Path, display_name: str) -> dict[str, Any]:
             "path": str(path),
             "exists": False,
             "status": "missing",
-            "missing_sections": list(MEMORY_SECTIONS),
+            "missing_sections": list(REQUIRED_MEMORY_SECTIONS),
+            "missing_optional_sections": list(OPTIONAL_MEMORY_SECTIONS),
             "reasons": [f"{display_name} is missing."],
         }
 
     parsed = parse_memory_sections(path.read_text(encoding="utf-8"))
-    missing_sections = [
+    missing_required_sections = [
         section
-        for section in MEMORY_SECTIONS
+        for section in REQUIRED_MEMORY_SECTIONS
+        if not any(line.strip() for line in parsed.get(section, []))
+    ]
+    missing_optional_sections = [
+        section
+        for section in OPTIONAL_MEMORY_SECTIONS
         if not any(line.strip() for line in parsed.get(section, []))
     ]
     return {
         "path": str(path),
         "exists": True,
-        "status": "healthy" if not missing_sections else "invalid",
-        "missing_sections": missing_sections,
-        "reasons": [] if not missing_sections else [
+        "status": "healthy" if not missing_required_sections else "invalid",
+        "missing_sections": missing_required_sections,
+        "missing_optional_sections": missing_optional_sections,
+        "reasons": [] if not missing_required_sections else [
             f"{display_name} is missing required sections or section content."
         ],
     }
@@ -584,6 +607,247 @@ def get_verification_state(
         "invalid_reasons": reasons,
         "latest_timestamp": (latest_entry or {}).get("timestamp"),
         "latest_verdict": (latest_entry or {}).get("verdict"),
+    }
+
+
+def normalize_workspace_relative_path(base_dir: Path, raw_path: Any) -> str | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+
+    candidate = Path(text).expanduser()
+    workspace_root = find_workspace_root(base_dir)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(workspace_root)
+        except ValueError:
+            return None
+    else:
+        relative = candidate
+
+    parts: list[str] = []
+    for part in relative.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+
+    if not parts:
+        return None
+    return Path(*parts).as_posix()
+
+
+def normalize_buglog_tags(raw_tags: Any) -> tuple[list[str] | None, list[str]]:
+    if not isinstance(raw_tags, list):
+        return None, ["tags must be a JSON array."]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_tags:
+        if not isinstance(item, str):
+            return None, ["tags entries must be strings."]
+        tag = item.strip().lower()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+    return normalized, []
+
+
+def sanitize_buglog_entry(
+    base_dir: Path,
+    entry: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    normalized = dict(entry)
+    reasons: list[str] = []
+
+    for key in BUGLOG_REQUIRED_KEYS:
+        if key not in entry:
+            reasons.append(f"Missing required key: {key}")
+
+    timestamp = str(entry.get("timestamp", "")).strip()
+    if not timestamp:
+        reasons.append("timestamp must be non-empty.")
+    elif parse_timestamp(timestamp) is None:
+        reasons.append("timestamp is not a valid ISO 8601 value.")
+    else:
+        normalized["timestamp"] = timestamp
+
+    file_path = normalize_workspace_relative_path(base_dir, entry.get("file"))
+    if file_path is None:
+        reasons.append(
+            "file must be a workspace-relative path or an absolute path inside the workspace."
+        )
+    else:
+        normalized["file"] = file_path
+
+    for key in ("symptom", "root_cause", "fix", "source"):
+        value = str(entry.get(key, "")).strip()
+        if not value:
+            reasons.append(f"{key} must be non-empty.")
+        else:
+            normalized[key] = value
+
+    tags, tag_reasons = normalize_buglog_tags(entry.get("tags"))
+    reasons.extend(tag_reasons)
+    if tags is not None:
+        normalized["tags"] = tags
+
+    return normalized, reasons
+
+
+def validate_buglog_entry(base_dir: Path, entry: dict[str, Any]) -> list[str]:
+    _, reasons = sanitize_buglog_entry(base_dir, entry)
+    return reasons
+
+
+def load_buglog_entries(base_dir: Path) -> dict[str, Any]:
+    path = get_state_paths(base_dir)["buglog"]
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "entries": [],
+            "invalid_lines": 0,
+            "invalid_reasons": [],
+            "line_records": [],
+        }
+
+    entries: list[dict[str, Any]] = []
+    invalid_lines = 0
+    invalid_reasons: list[str] = []
+    line_records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: invalid JSON ({exc}).")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        if not isinstance(parsed, dict):
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: entry must decode to a JSON object.")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        normalized, reasons = sanitize_buglog_entry(base_dir, parsed)
+        if reasons:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: {'; '.join(reasons)}")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        entries.append(normalized)
+        line_records.append({"raw": line, "valid": True, "entry": normalized})
+
+    return {
+        "path": str(path),
+        "exists": True,
+        "entries": entries,
+        "invalid_lines": invalid_lines,
+        "invalid_reasons": invalid_reasons,
+        "line_records": line_records,
+    }
+
+
+def append_buglog_entry(base_dir: Path, entry: dict[str, Any]) -> Path:
+    payload = dict(entry)
+    payload.setdefault("timestamp", now_timestamp())
+    normalized, reasons = sanitize_buglog_entry(base_dir, payload)
+    if reasons:
+        raise SystemExit("Invalid buglog entry:\n- " + "\n- ".join(reasons))
+
+    path = ensure_state_files(base_dir)["buglog"]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(normalized, sort_keys=True) + "\n")
+    return path
+
+
+def buglog_path_matches(base_dir: Path, path_filter: str | None, entry_path: str) -> bool:
+    if not path_filter:
+        return True
+    normalized_filter = normalize_workspace_relative_path(base_dir, path_filter)
+    if normalized_filter is None:
+        normalized_filter = str(path_filter).strip().replace("\\", "/").strip("/")
+    if not normalized_filter:
+        return True
+    return entry_path == normalized_filter or entry_path.startswith(f"{normalized_filter.rstrip('/')}/")
+
+
+def score_buglog_entry(entry: dict[str, Any], term: str) -> int:
+    query = term.strip().lower()
+    if not query:
+        return 0
+
+    score = 0
+    searchable_fields = {
+        "file": 3,
+        "symptom": 2,
+        "root_cause": 2,
+        "fix": 2,
+        "tags": 1,
+        "source": 1,
+    }
+    for field, weight in searchable_fields.items():
+        value = entry.get(field)
+        if isinstance(value, list):
+            haystack = " ".join(str(item) for item in value)
+        else:
+            haystack = str(value or "")
+        lowered = haystack.lower()
+        if query in lowered:
+            score += max(1, lowered.count(query)) * weight
+
+    file_value = str(entry.get("file", ""))
+    if file_value == term or file_value.lower().endswith(query):
+        score += 2
+    return score
+
+
+def search_buglog_entries(
+    base_dir: Path,
+    term: str,
+    *,
+    path: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    loaded = load_buglog_entries(base_dir)
+    ranked: list[dict[str, Any]] = []
+    for entry in loaded["entries"]:
+        if not buglog_path_matches(base_dir, path, str(entry.get("file", ""))):
+            continue
+        score = score_buglog_entry(entry, term)
+        if score <= 0:
+            continue
+        ranked.append({"score": score, "entry": entry})
+
+    ranked.sort(
+        key=lambda item: (item["score"], str(item["entry"].get("timestamp", ""))),
+        reverse=True,
+    )
+    return ranked[: max(0, limit)]
+
+
+def get_buglog_state(base_dir: Path) -> dict[str, Any]:
+    loaded = load_buglog_entries(base_dir)
+    latest = loaded["entries"][-1] if loaded["entries"] else None
+    if not loaded["exists"]:
+        status = "missing"
+    elif loaded["invalid_lines"] > 0:
+        status = "invalid"
+    else:
+        status = "healthy"
+
+    return {
+        "path": loaded["path"],
+        "exists": loaded["exists"],
+        "status": status,
+        "entry_count": len(loaded["entries"]),
+        "invalid_lines": loaded["invalid_lines"],
+        "invalid_reasons": loaded["invalid_reasons"],
+        "latest_timestamp": (latest or {}).get("timestamp"),
     }
 
 
@@ -1069,6 +1333,7 @@ def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
     memory_sync = get_memory_sync_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy_info["data"])
     verification = get_verification_state(base_dir, task_loop)
+    buglog = get_buglog_state(base_dir)
     paths = get_state_paths(base_dir)
     return {
         "workspace_root": str(find_workspace_root(base_dir)),
@@ -1077,6 +1342,7 @@ def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
         "shared_memory": shared_memory,
         "memory_candidates": memory_candidates,
         "memory_sync": memory_sync,
+        "buglog": buglog,
         "policy": policy_info,
         "task_loop": task_loop,
         "verification": verification,

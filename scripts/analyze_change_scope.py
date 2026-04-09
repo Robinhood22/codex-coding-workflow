@@ -5,21 +5,27 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from workflow_state import (
     classify_risk,
+    ensure_state_files,
     find_git_root,
     get_memory_candidate_state,
     find_workspace_root,
+    get_buglog_state,
     get_memory_status,
     get_memory_sync_state,
+    get_state_paths,
     get_shared_memory_status,
     get_task_loop_status,
     get_verification_state,
     is_workflow_state_path,
     load_policy,
+    normalize_workspace_relative_path,
+    parse_timestamp,
     should_refresh_memory,
     verification_required_for,
 )
@@ -50,6 +56,8 @@ CODE_EXTENSIONS = {
 }
 CONFIG_EXTENSIONS = {".env", ".ini", ".json", ".toml", ".yaml", ".yml"}
 DOC_EXTENSIONS = {".md", ".mdx", ".rst", ".txt"}
+HOOK_REPEAT_WINDOW_MINUTES = 30
+HOOK_PATH_KEYS = {"file_path", "path", "target_file", "relative_workspace_path"}
 
 
 def run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -111,6 +119,125 @@ def resolve_base_dir(payload: Any) -> Path:
         return candidate
 
     return Path.cwd()
+
+
+def gather_hook_target_paths(payload: Any, base_dir: Path) -> list[Path]:
+    workspace_root = find_workspace_root(base_dir)
+    paths: list[Path] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in HOOK_PATH_KEYS and isinstance(value, str):
+                    candidate = Path(value).expanduser()
+                    if candidate.is_absolute():
+                        paths.append(candidate)
+                    elif key == "relative_workspace_path":
+                        paths.append(workspace_root / candidate)
+                    else:
+                        paths.append(base_dir / candidate)
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return paths
+
+
+def load_hook_runtime_state(base_dir: Path) -> dict[str, Any]:
+    path = get_state_paths(base_dir)["hook_state"]
+    if not path.exists():
+        return {"files": {}}
+
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"files": {}}
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), dict):
+        return {"files": {}}
+    return {"files": dict(parsed["files"])}
+
+
+def persist_hook_runtime_state(base_dir: Path, state: dict[str, Any]) -> str:
+    paths = ensure_state_files(base_dir)
+    paths["runtime_dir"].mkdir(parents=True, exist_ok=True)
+    hook_state_path = paths["hook_state"]
+    hook_state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(hook_state_path)
+
+
+def update_hook_runtime(base_dir: Path, payload: Any) -> dict[str, Any]:
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(minutes=HOOK_REPEAT_WINDOW_MINUTES)
+    state = load_hook_runtime_state(base_dir)
+    files_state = state.setdefault("files", {})
+
+    touched_paths: list[str] = []
+    repeated_edit_paths: list[str] = []
+    for candidate in gather_hook_target_paths(payload, base_dir):
+        relative = normalize_workspace_relative_path(base_dir, candidate)
+        if not relative or is_workflow_state_path(relative):
+            continue
+        if relative not in touched_paths:
+            touched_paths.append(relative)
+
+    for relative in touched_paths:
+        current = files_state.get(relative, {})
+        if not isinstance(current, dict):
+            current = {}
+        events: list[str] = []
+        for raw_timestamp in current.get("events", []):
+            parsed = parse_timestamp(str(raw_timestamp))
+            if parsed is not None and parsed >= cutoff:
+                events.append(parsed.isoformat())
+        events.append(now.isoformat())
+
+        last_reminder = parse_timestamp(str(current.get("last_reminder_at") or ""))
+        should_remind = len(events) >= 3 and (
+            last_reminder is None or last_reminder < cutoff
+        )
+        if should_remind:
+            repeated_edit_paths.append(relative)
+
+        files_state[relative] = {
+            "events": events,
+            "last_reminder_at": now.isoformat() if should_remind else current.get("last_reminder_at"),
+        }
+
+    stale_paths: list[str] = []
+    for relative, current in files_state.items():
+        if not isinstance(current, dict):
+            stale_paths.append(relative)
+            continue
+        events: list[str] = []
+        for raw_timestamp in current.get("events", []):
+            parsed = parse_timestamp(str(raw_timestamp))
+            if parsed is not None and parsed >= cutoff:
+                events.append(parsed.isoformat())
+        last_reminder = parse_timestamp(str(current.get("last_reminder_at") or ""))
+        last_reminder_value = (
+            last_reminder.isoformat()
+            if last_reminder is not None and last_reminder >= cutoff
+            else None
+        )
+        if not events and last_reminder_value is None:
+            stale_paths.append(relative)
+            continue
+        files_state[relative] = {
+            "events": events,
+            "last_reminder_at": last_reminder_value,
+        }
+    for relative in stale_paths:
+        files_state.pop(relative, None)
+
+    hook_state_path = persist_hook_runtime_state(base_dir, {"files": files_state})
+    return {
+        "path": hook_state_path,
+        "touched_paths": touched_paths,
+        "repeated_edit_paths": repeated_edit_paths,
+    }
 
 
 def parse_status_paths(status_output: str) -> set[str]:
@@ -203,6 +330,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     shared_memory = get_shared_memory_status(base_dir)
     memory_candidates = get_memory_candidate_state(base_dir)
     memory_sync = get_memory_sync_state(base_dir)
+    buglog = get_buglog_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy)
     verification = get_verification_state(base_dir, task_loop)
     needs_state_repair = (
@@ -210,6 +338,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         or shared_memory["status"] == "invalid"
         or memory_candidates["status"] == "invalid"
         or memory_sync["status"] == "invalid"
+        or buglog["status"] == "invalid"
         or policy_info["status"] == "invalid"
         or task_loop["status"] == "invalid"
         or verification["status"] == "invalid"
@@ -240,6 +369,8 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
             "memory_candidates_status": memory_candidates["status"],
             "memory_candidates_pending": memory_candidates["pending_count"],
             "memory_sync_status": memory_sync["status"],
+            "buglog_status": buglog["status"],
+            "buglog_entry_count": buglog["entry_count"],
             "memory_refresh_needed": False,
             "policy_status": policy_info["status"],
             "task_loop_status": task_loop["status"],
@@ -316,6 +447,8 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         "memory_candidates_status": memory_candidates["status"],
         "memory_candidates_pending": memory_candidates["pending_count"],
         "memory_sync_status": memory_sync["status"],
+        "buglog_status": buglog["status"],
+        "buglog_entry_count": buglog["entry_count"],
         "memory_refresh_needed": memory_refresh_needed,
         "policy_status": policy_info["status"],
         "task_loop_status": task_loop["status"],
@@ -362,10 +495,19 @@ def render_summary(result: dict[str, Any]) -> str:
 
 
 def render_hook_message(result: dict[str, Any]) -> str:
-    if result["status"] != "ok":
-        return ""
-
     reminders: list[str] = []
+    repeated_edit_paths = result.get("repeated_edit_paths", [])
+    for relative in repeated_edit_paths:
+        reminders.append(
+            "[codex-coding-workflows] "
+            f"`{relative}` was edited at least 3 times in the last {HOOK_REPEAT_WINDOW_MINUTES} "
+            "minutes. If this is a bug fix, search bug memory before another rewrite, and "
+            "append a confirmed buglog entry after a meaningful check or explicit user confirmation."
+        )
+
+    if result["status"] != "ok":
+        return "\n".join(reminders)
+
     count = result["changed_file_count"]
     lines = result["total_changed_lines"]
 
@@ -430,6 +572,8 @@ def main() -> int:
     payload = load_payload_from_stdin() if args.hook else {}
     base_dir = Path(args.repo).expanduser() if args.repo else resolve_base_dir(payload)
     result = analyze_change_scope(base_dir)
+    if args.hook:
+        result.update(update_hook_runtime(base_dir, payload))
 
     if args.json:
         print(json.dumps(result, indent=2))

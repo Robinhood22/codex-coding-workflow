@@ -22,6 +22,7 @@ from workflow_state import (
     ensure_state_files,
     get_state_paths,
     inspect_workflow_state,
+    load_buglog_entries,
     load_memory_candidate_entries,
     load_memory_sync_entries,
     load_policy,
@@ -507,6 +508,7 @@ def build_check_report(base_dir: Path) -> dict[str, Any]:
         "shared_memory": summary["shared_memory"],
         "memory_candidates": summary["memory_candidates"],
         "memory_sync": summary["memory_sync"],
+        "buglog": summary["buglog"],
         "policy": {
             "path": summary["policy"]["path"],
             "status": summary["policy"]["status"],
@@ -552,6 +554,7 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
     before = build_check_report(base_dir)
     backups: list[str] = []
     repaired: list[str] = []
+    data_loss: list[str] = []
     manual_review_required = list(before["manual_review_required"])
 
     memory_status = before["files"]["memory"]["status"]
@@ -614,6 +617,27 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
         paths["verification_log"].write_text(payload, encoding="utf-8")
         repaired.append("verification")
 
+    buglog_loaded = load_buglog_entries(base_dir)
+    if buglog_loaded["invalid_lines"] > 0:
+        backup_path = backup_state_file(base_dir, paths["buglog"])
+        if backup_path:
+            backups.append(backup_path)
+        serialized = [
+            json.dumps(entry, sort_keys=True)
+            for entry in buglog_loaded["entries"]
+        ]
+        payload = "\n".join(serialized)
+        if payload:
+            payload += "\n"
+        paths["buglog"].write_text(payload, encoding="utf-8")
+        repaired.append("buglog")
+        data_loss.append(
+            "buglog: dropped "
+            f"{buglog_loaded['invalid_lines']} invalid line(s) while preserving "
+            f"{len(buglog_loaded['entries'])} valid entr"
+            f"{'y' if len(buglog_loaded['entries']) == 1 else 'ies'}."
+        )
+
     memory_candidates_loaded = load_memory_candidate_entries(base_dir)
     if memory_candidates_loaded["invalid_lines"] > 0:
         backup_path = backup_state_file(base_dir, paths["memory_candidates"])
@@ -667,6 +691,7 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
         "state_dir": before["state_dir"],
         "repaired": sorted(set(repaired)),
         "backups": backups,
+        "data_loss": data_loss,
         "manual_review_required": sorted(set(manual_review_required)),
         "before": before["files"],
         "after": after["files"],
@@ -708,6 +733,9 @@ def render_repair(report: dict[str, Any]) -> str:
         f"Repaired files: {', '.join(report['repaired']) if report['repaired'] else 'none'}",
         f"Backups created: {len(report['backups'])}",
     ]
+    if report.get("data_loss"):
+        lines.append("Data loss:")
+        lines.extend(f"- {item}" for item in report["data_loss"])
     teams_after = report.get("teams_after", {})
     if teams_after.get("runs"):
         lines.append("Team runs after repair:")
