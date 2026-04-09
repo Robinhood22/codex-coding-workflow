@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from workflow_state import (
+    append_reasoning_hotspot_entry,
+    build_recurring_reasoning_hotspot_summary,
     classify_risk,
+    dedupe_non_empty_strings,
     ensure_state_files,
     find_git_root,
     get_memory_candidate_state,
@@ -18,12 +21,14 @@ from workflow_state import (
     get_buglog_state,
     get_memory_status,
     get_memory_sync_state,
+    get_reasoning_hotspot_state,
     get_state_paths,
     get_shared_memory_status,
     get_task_loop_status,
     get_verification_state,
     is_workflow_state_path,
     load_policy,
+    load_reasoning_hotspot_entries,
     normalize_workspace_relative_path,
     parse_timestamp,
     should_refresh_memory,
@@ -322,6 +327,177 @@ def determine_recommended_skills(
     return skills
 
 
+def build_reasoning_hotspots(
+    *,
+    changed_file_count: int,
+    total_changed_lines: int,
+    risk_level: str,
+    task_loop_needed: bool,
+    task_loop_stale: bool,
+    task_loop_mode: str,
+    task_stream_count: int,
+    verification_state: str,
+    uncovered_open_streams: list[str],
+    repeated_edit_paths: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    hotspots: list[dict[str, Any]] = []
+
+    if task_loop_needed or task_loop_stale:
+        if task_loop_stale:
+            summary = "The live task loop looks stale or invalid relative to the current work."
+        else:
+            summary = (
+                f"The change set grew to {changed_file_count} files / {total_changed_lines} lines "
+                "and may have outgrown the initial plan."
+            )
+        hotspots.append(
+            {
+                "kind": "plan-drift",
+                "summary": summary,
+                "recommended_skills": ["execution-task-loop"],
+            }
+        )
+
+    if risk_level in {"medium", "high"}:
+        hotspots.append(
+            {
+                "kind": "risk-escalation",
+                "summary": (
+                    f"The active change set is currently classified as {risk_level}-risk and "
+                    "deserves a fresh reasoning pass before more edits."
+                ),
+                "recommended_skills": ["policy-risk-check", "verify-change"],
+            }
+        )
+
+    if repeated_edit_paths:
+        hotspots.append(
+            {
+                "kind": "repeat-rewrite",
+                "summary": (
+                    "Repeated edits hit the same file(s) inside the last "
+                    f"{HOOK_REPEAT_WINDOW_MINUTES} minutes: {', '.join(repeated_edit_paths)}."
+                ),
+                "recommended_skills": ["execution-task-loop", "verify-change"],
+            }
+        )
+
+    if verification_state in {"missing", "stale", "invalid"}:
+        hotspots.append(
+            {
+                "kind": "verification-gap",
+                "summary": (
+                    f"Verification is {verification_state}; the current work no longer has a "
+                    "clean evidence trail."
+                ),
+                "recommended_skills": ["verify-change"],
+            }
+        )
+    elif uncovered_open_streams:
+        joined = ", ".join(uncovered_open_streams)
+        hotspots.append(
+            {
+                "kind": "stream-coverage-gap",
+                "summary": (
+                    "Open task streams are missing current verification coverage: "
+                    f"{joined}."
+                ),
+                "recommended_skills": ["verify-change", "execution-task-loop"],
+            }
+        )
+
+    if task_loop_mode == "streams" and task_stream_count > 1:
+        hotspots.append(
+            {
+                "kind": "multi-stream-coordination",
+                "summary": (
+                    f"The work is split across {task_stream_count} task streams, so the active "
+                    "plan may need a quick coordination check before the next edit."
+                ),
+                "recommended_skills": ["execution-task-loop"],
+            }
+        )
+
+    deduped: list[dict[str, Any]] = []
+    seen_kinds: set[str] = set()
+    for hotspot in hotspots:
+        kind = str(hotspot.get("kind") or "")
+        if kind in seen_kinds:
+            continue
+        seen_kinds.add(kind)
+        deduped.append(hotspot)
+    return deduped
+
+
+def build_micro_reasoning_questions(task_loop_mode: str) -> list[str]:
+    questions = [
+        "What changed in my understanding since the initial plan?",
+        "Which assumption, file, or stream is now the least certain?",
+        "What is the smallest next edit or verification probe that would reduce uncertainty?",
+    ]
+    if task_loop_mode == "streams":
+        questions.insert(
+            2,
+            "Do the current task streams still match reality, or should I split/merge/reorder them?",
+        )
+    else:
+        questions.insert(
+            2,
+            "Does the current task loop still reflect the real next step, or does it need to be refreshed?",
+        )
+    return questions
+
+
+def collect_reasoning_hotspot_skills(hotspots: list[dict[str, Any]]) -> list[str]:
+    skills: list[str] = []
+    for hotspot in hotspots:
+        skills.extend(
+            str(item)
+            for item in hotspot.get("recommended_skills", [])
+            if str(item).strip()
+        )
+    return dedupe_non_empty_strings(skills)
+
+
+def enrich_reasoning_guidance(
+    base_dir: Path,
+    result: dict[str, Any],
+    *,
+    repeated_edit_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    hotspots = build_reasoning_hotspots(
+        changed_file_count=int(result.get("changed_file_count", 0) or 0),
+        total_changed_lines=int(result.get("total_changed_lines", 0) or 0),
+        risk_level=str(result.get("risk_level") or "low"),
+        task_loop_needed=bool(result.get("task_loop_needed")),
+        task_loop_stale=bool(result.get("task_loop_stale")),
+        task_loop_mode=str(result.get("task_loop_mode") or "legacy"),
+        task_stream_count=int(result.get("task_stream_count", 1) or 1),
+        verification_state=str(result.get("verification_state") or "missing"),
+        uncovered_open_streams=list(result.get("uncovered_open_streams", [])),
+        repeated_edit_paths=repeated_edit_paths,
+    )
+    hotspot_history = get_reasoning_hotspot_state(base_dir)
+    loaded_hotspots = load_reasoning_hotspot_entries(base_dir)
+    recurring_hotspots = build_recurring_reasoning_hotspot_summary(
+        loaded_hotspots["entries"],
+        active_kinds=[str(item.get("kind") or "") for item in hotspots],
+    )
+    hotspot_skills = collect_reasoning_hotspot_skills(hotspots)
+    recurring_skills = collect_reasoning_hotspot_skills(recurring_hotspots)
+
+    result["reasoning_hotspots"] = hotspots
+    result["micro_reasoning_recommended"] = bool(hotspots)
+    result["recent_reasoning_hotspots"] = hotspot_history.get("recent_entries", [])
+    result["recurring_reasoning_hotspots"] = recurring_hotspots
+    result["micro_reasoning_escalation_recommended"] = bool(recurring_hotspots)
+    result["escalated_recommended_skills"] = recurring_skills
+    result["recommended_skills"] = dedupe_non_empty_strings(
+        list(result.get("recommended_skills", [])) + hotspot_skills + recurring_skills
+    )
+    return result
+
+
 def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     workspace_root = find_workspace_root(base_dir)
     policy_info = load_policy(base_dir)
@@ -330,14 +506,17 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     shared_memory = get_shared_memory_status(base_dir)
     memory_candidates = get_memory_candidate_state(base_dir)
     memory_sync = get_memory_sync_state(base_dir)
+    reasoning_hotspots_state = get_reasoning_hotspot_state(base_dir)
     buglog = get_buglog_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy)
     verification = get_verification_state(base_dir, task_loop)
+    uncovered_open_streams = list(verification.get("uncovered_open_streams", []))
     needs_state_repair = (
         memory["status"] == "invalid"
         or shared_memory["status"] == "invalid"
         or memory_candidates["status"] == "invalid"
         or memory_sync["status"] == "invalid"
+        or reasoning_hotspots_state["status"] == "invalid"
         or buglog["status"] == "invalid"
         or policy_info["status"] == "invalid"
         or task_loop["status"] == "invalid"
@@ -369,14 +548,29 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
             "memory_candidates_status": memory_candidates["status"],
             "memory_candidates_pending": memory_candidates["pending_count"],
             "memory_sync_status": memory_sync["status"],
+            "reasoning_hotspots_status": reasoning_hotspots_state["status"],
+            "reasoning_hotspots_entry_count": reasoning_hotspots_state["entry_count"],
             "buglog_status": buglog["status"],
             "buglog_entry_count": buglog["entry_count"],
             "memory_refresh_needed": False,
             "policy_status": policy_info["status"],
             "task_loop_status": task_loop["status"],
             "task_loop_stale": task_loop["stale"],
+            "task_loop_mode": task_loop.get("mode", "legacy"),
+            "task_stream_count": task_loop.get("stream_count", 1),
             "verification_state": verification["status"],
+            "verification_coverage_gap": bool(uncovered_open_streams),
+            "uncovered_open_streams": uncovered_open_streams,
             "verification_log_present": verification["entry_count"] > 0,
+            "micro_reasoning_recommended": False,
+            "reasoning_hotspots": [],
+            "recent_reasoning_hotspots": reasoning_hotspots_state.get("recent_entries", []),
+            "recurring_reasoning_hotspots": [],
+            "micro_reasoning_questions": build_micro_reasoning_questions(
+                task_loop.get("mode", "legacy")
+            ),
+            "micro_reasoning_escalation_recommended": False,
+            "escalated_recommended_skills": [],
             "state_repair_needed": needs_state_repair,
             "recommended_skills": recommended_skills,
             "policy": {
@@ -428,8 +622,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         verification_recommended=verification_recommended,
         risk_level=risk_level,
     )
-
-    return {
+    result = {
         "status": "ok",
         "repo_root": str(repo_root),
         "workspace_root": str(workspace_root),
@@ -447,14 +640,29 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         "memory_candidates_status": memory_candidates["status"],
         "memory_candidates_pending": memory_candidates["pending_count"],
         "memory_sync_status": memory_sync["status"],
+        "reasoning_hotspots_status": reasoning_hotspots_state["status"],
+        "reasoning_hotspots_entry_count": reasoning_hotspots_state["entry_count"],
         "buglog_status": buglog["status"],
         "buglog_entry_count": buglog["entry_count"],
         "memory_refresh_needed": memory_refresh_needed,
         "policy_status": policy_info["status"],
         "task_loop_status": task_loop["status"],
         "task_loop_stale": task_loop_stale,
+        "task_loop_mode": task_loop.get("mode", "legacy"),
+        "task_stream_count": task_loop.get("stream_count", 1),
         "verification_state": verification["status"],
+        "verification_coverage_gap": bool(uncovered_open_streams),
+        "uncovered_open_streams": uncovered_open_streams,
         "verification_log_present": verification["entry_count"] > 0,
+        "micro_reasoning_recommended": False,
+        "reasoning_hotspots": [],
+        "recent_reasoning_hotspots": reasoning_hotspots_state.get("recent_entries", []),
+        "recurring_reasoning_hotspots": [],
+        "micro_reasoning_questions": build_micro_reasoning_questions(
+            task_loop.get("mode", "legacy")
+        ),
+        "micro_reasoning_escalation_recommended": False,
+        "escalated_recommended_skills": [],
         "state_repair_needed": needs_state_repair,
         "recommended_skills": recommended_skills,
         "policy": {
@@ -465,6 +673,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         },
         "categories": categories,
     }
+    return enrich_reasoning_guidance(base_dir, result)
 
 
 def render_summary(result: dict[str, Any]) -> str:
@@ -481,7 +690,9 @@ def render_summary(result: dict[str, Any]) -> str:
         "Categories: {categories}\n"
         "Risk: {risk}\n"
         "Task loop: {task_loop}\n"
-        "Verification log: {verification}"
+        "Verification log: {verification}\n"
+        "Micro reasoning: {micro_reasoning}\n"
+        "Hotspot escalation: {hotspot_escalation}"
     ).format(
         count=result["changed_file_count"],
         lines=result["total_changed_lines"],
@@ -491,6 +702,12 @@ def render_summary(result: dict[str, Any]) -> str:
         risk=result["risk_level"],
         task_loop=result.get("task_loop_status", "unknown"),
         verification=result.get("verification_state", "unknown"),
+        micro_reasoning="recommended" if result.get("micro_reasoning_recommended") else "not needed",
+        hotspot_escalation=(
+            "recommended"
+            if result.get("micro_reasoning_escalation_recommended")
+            else "not needed"
+        ),
     )
 
 
@@ -545,7 +762,82 @@ def render_hook_message(result: dict[str, Any]) -> str:
             "PASS, FAIL, or PARTIAL verdict."
         )
 
+    hotspots = build_reasoning_hotspots(
+        changed_file_count=result["changed_file_count"],
+        total_changed_lines=result["total_changed_lines"],
+        risk_level=result["risk_level"],
+        task_loop_needed=result["task_loop_needed"],
+        task_loop_stale=result["task_loop_stale"],
+        task_loop_mode=result.get("task_loop_mode", "legacy"),
+        task_stream_count=int(result.get("task_stream_count", 1) or 1),
+        verification_state=result.get("verification_state", "missing"),
+        uncovered_open_streams=list(result.get("uncovered_open_streams", [])),
+        repeated_edit_paths=repeated_edit_paths,
+    )
+    if hotspots:
+        hotspot_lines = [f"- {hotspot['summary']}" for hotspot in hotspots[:3]]
+        question_lines = [
+            f"- {question}" for question in result.get("micro_reasoning_questions", [])
+        ]
+        reminders.append(
+            "[codex-coding-workflows] Keep the initial plan as the anchor. "
+            "Hotspot-triggered micro reasoning is recommended now; it supplements, not replaces, "
+            "the upfront plan.\n"
+            "Hotspots:\n"
+            + "\n".join(hotspot_lines)
+            + "\nBefore the next edit, run a short checkpoint:\n"
+            + "\n".join(question_lines)
+        )
+    recurring_hotspots = result.get("recurring_reasoning_hotspots", [])
+    if recurring_hotspots:
+        recurring_lines = []
+        for hotspot in recurring_hotspots[:2]:
+            skills = ", ".join(
+                f"`{skill}`" for skill in hotspot.get("recommended_skills", [])
+            ) or "`execution-task-loop`"
+            recurring_lines.append(f"- {hotspot['summary']} Escalate with: {skills}.")
+        reminders.append(
+            "[codex-coding-workflows] Recent hotspot history shows this is a recurring pattern.\n"
+            + "\n".join(recurring_lines)
+        )
+
     return "\n".join(reminders)
+
+
+def build_hook_hotspot_related_items(result: dict[str, Any], hotspot: dict[str, Any]) -> list[str]:
+    kind = str(hotspot.get("kind") or "")
+    if kind == "repeat-rewrite":
+        return [str(item) for item in result.get("repeated_edit_paths", []) if str(item).strip()]
+    if kind == "stream-coverage-gap":
+        return [str(item) for item in result.get("uncovered_open_streams", []) if str(item).strip()]
+    return []
+
+
+def persist_hook_reasoning_hotspots(base_dir: Path, result: dict[str, Any]) -> list[str]:
+    if result.get("status") != "ok":
+        return []
+
+    written: list[str] = []
+    for hotspot in result.get("reasoning_hotspots", []):
+        payload = {
+            "kind": hotspot["kind"],
+            "summary": hotspot["summary"],
+            "source": "post-tool-hook",
+            "recommended_skills": hotspot.get("recommended_skills", []),
+            "related_items": build_hook_hotspot_related_items(result, hotspot),
+            "questions": result.get("micro_reasoning_questions", []),
+            "risk_level": result.get("risk_level"),
+            "task_loop_mode": result.get("task_loop_mode"),
+            "task_stream_count": result.get("task_stream_count"),
+        }
+        path = append_reasoning_hotspot_entry(
+            base_dir,
+            payload,
+            suppress_recent_duplicates=True,
+        )
+        if path is not None:
+            written.append(str(path))
+    return written
 
 
 def load_payload_from_stdin() -> Any:
@@ -574,6 +866,12 @@ def main() -> int:
     result = analyze_change_scope(base_dir)
     if args.hook:
         result.update(update_hook_runtime(base_dir, payload))
+        result = enrich_reasoning_guidance(
+            base_dir,
+            result,
+            repeated_edit_paths=list(result.get("repeated_edit_paths", [])),
+        )
+        result["reasoning_hotspot_log_paths"] = persist_hook_reasoning_hotspots(base_dir, result)
 
     if args.json:
         print(json.dumps(result, indent=2))

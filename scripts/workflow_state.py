@@ -13,6 +13,7 @@ from typing import Any
 
 STATE_DIRNAME = ".codex-workflows"
 BACKUPS_DIRNAME = "backups"
+TASK_STREAMS_DIRNAME = "task-streams"
 SCHEMA_VERSION = 3
 REQUIRED_MEMORY_SECTIONS = (
     "Stable Facts",
@@ -31,6 +32,19 @@ VERIFICATION_REQUIRED_KEYS = ("timestamp", "scope", "checks", "verdict")
 VALID_VERDICTS = {"PASS", "FAIL", "PARTIAL"}
 MEMORY_CANDIDATE_REQUIRED_KEYS = ("scope", "section", "text", "source")
 BUGLOG_REQUIRED_KEYS = ("timestamp", "file", "symptom", "root_cause", "fix", "tags", "source")
+REASONING_HOTSPOT_REQUIRED_KEYS = ("timestamp", "kind", "summary", "source")
+HOTSPOT_DEDUPE_WINDOW_MINUTES = 30
+HOTSPOT_HISTORY_LIMIT = 5
+HOTSPOT_RECURRING_WINDOW_DAYS = 7
+HOTSPOT_RECURRING_THRESHOLD = 2
+HOTSPOT_RECURRING_SKILLS: dict[str, tuple[str, ...]] = {
+    "plan-drift": ("implementation-plan", "execution-task-loop"),
+    "risk-escalation": ("policy-risk-check", "verify-change", "agentic-code-review"),
+    "repeat-rewrite": ("agentic-code-review", "verify-change", "execution-task-loop"),
+    "verification-gap": ("verify-change", "ship-readiness-audit"),
+    "stream-coverage-gap": ("verify-change", "execution-task-loop"),
+    "multi-stream-coordination": ("execution-task-loop", "team-orchestration"),
+}
 
 SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("anthropic-api-key", r"\bsk-ant-(?:api|admin)[a-zA-Z0-9_\-]{20,}\b"),
@@ -158,12 +172,14 @@ def get_state_paths(base_dir: Path) -> dict[str, Path]:
     return {
         "state_dir": state_dir,
         "backups_dir": state_dir / BACKUPS_DIRNAME,
+        "task_streams_dir": state_dir / TASK_STREAMS_DIRNAME,
         "state_gitignore": state_dir / ".gitignore",
         "readme": state_dir / "README.md",
         "memory": state_dir / "memory.md",
         "shared_memory": state_dir / "shared-memory.md",
         "memory_candidates": state_dir / "memory-candidates.jsonl",
         "memory_sync_log": state_dir / "memory-sync-log.jsonl",
+        "reasoning_hotspots": state_dir / "reasoning-hotspots.jsonl",
         "task_loop": state_dir / "active-task-loop.md",
         "verification_log": state_dir / "verification-log.jsonl",
         "buglog": state_dir / "buglog.jsonl",
@@ -224,8 +240,8 @@ def default_readme_text() -> str:
         "`codex-coding-workflows` plugin.\n\n"
         "Local memory lives in `memory.md`, shared memory lives in `shared-memory.md`, "
         "pending automatic memory promotions live in `memory-candidates.jsonl`, sync "
-        "history lives in `memory-sync-log.jsonl`, and confirmed bug-fix recall lives "
-        "in `buglog.jsonl`.\n\n"
+        "history lives in `memory-sync-log.jsonl`, durable hotspot recall lives in "
+        "`reasoning-hotspots.jsonl`, and confirmed bug-fix recall lives in `buglog.jsonl`.\n\n"
         "The `backups/` directory stores repair-time snapshots before malformed "
         "workflow files are rewritten. Runtime-only hook data lives under `runtime/` "
         "and is ignored via `.codex-workflows/.gitignore`.\n"
@@ -241,6 +257,7 @@ def ensure_state_files(base_dir: Path) -> dict[str, Path]:
     state_dir = paths["state_dir"]
     state_dir.mkdir(parents=True, exist_ok=True)
     paths["backups_dir"].mkdir(parents=True, exist_ok=True)
+    paths["task_streams_dir"].mkdir(parents=True, exist_ok=True)
 
     defaults = {
         "state_gitignore": "runtime/\n",
@@ -249,6 +266,7 @@ def ensure_state_files(base_dir: Path) -> dict[str, Path]:
         "shared_memory": default_shared_memory_text(),
         "memory_candidates": "",
         "memory_sync_log": "",
+        "reasoning_hotspots": "",
         "task_loop": default_task_loop_text(),
         "verification_log": "",
         "buglog": "",
@@ -409,6 +427,42 @@ def extract_updated_at(markdown_text: str) -> str | None:
     return None
 
 
+def extract_prefixed_value(markdown_text: str, prefix: str) -> str | None:
+    target = f"{prefix}:"
+    for line in markdown_text.splitlines():
+        if line.startswith(target):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def normalize_stream_id(stream_id: str | None) -> str:
+    lowered = str(stream_id or "").strip().lower()
+    collapsed = re.sub(r"[^a-z0-9]+", "-", lowered)
+    return collapsed.strip("-") or "default"
+
+
+def stream_title_from_id(stream_id: str) -> str:
+    return " ".join(part.capitalize() for part in stream_id.split("-") if part) or "Default"
+
+
+def get_task_stream_path(base_dir: Path, stream_id: str) -> Path:
+    return get_state_paths(base_dir)["task_streams_dir"] / f"{normalize_stream_id(stream_id)}.md"
+
+
+def list_task_stream_paths(base_dir: Path) -> list[Path]:
+    task_streams_dir = get_state_paths(base_dir)["task_streams_dir"]
+    if not task_streams_dir.exists():
+        return []
+    return sorted(path for path in task_streams_dir.glob("*.md") if path.is_file())
+
+
+def extract_primary_stream_id(markdown_text: str) -> str | None:
+    primary = extract_prefixed_value(markdown_text, "Primary stream")
+    if primary is None:
+        return None
+    return normalize_stream_id(primary)
+
+
 def normalize_task_item(line: str) -> str:
     stripped = line.strip()
     if not stripped:
@@ -434,35 +488,244 @@ def demote_to_pending(line: str) -> str:
     return f"- [ ] Pending: {body}"
 
 
-def normalize_task_loop_text(raw_text: str) -> str:
+def normalize_task_lines(raw_text: str) -> list[str]:
     task_lines: list[str] = []
     for raw_line in raw_text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("# ") or line.startswith("Updated:"):
+        if (
+            not line
+            or line.startswith("# ")
+            or line.startswith("## ")
+            or line.startswith("Updated:")
+            or line.startswith("ID:")
+            or line.startswith("Title:")
+            or line.startswith("State:")
+            or line.startswith("Mode:")
+            or line.startswith("Primary stream:")
+            or line in {"No active task loop yet.", "No active task stream yet."}
+        ):
             continue
         task_lines.append(normalize_task_item(line))
 
     if not task_lines:
-        body = "No active task loop yet."
-    else:
-        active_indices = [index for index, line in enumerate(task_lines) if ACTIVE_LINE_RE.match(line)]
-        if not active_indices:
-            task_lines[0] = promote_to_active(task_lines[0])
-        else:
-            first_active = active_indices[0]
-            task_lines[first_active] = promote_to_active(task_lines[first_active])
-            for index in active_indices[1:]:
-                task_lines[index] = demote_to_pending(task_lines[index])
-        body = "\n".join(task_lines)
+        return []
 
+    active_indices = [index for index, line in enumerate(task_lines) if ACTIVE_LINE_RE.match(line)]
+    if not active_indices:
+        task_lines[0] = promote_to_active(task_lines[0])
+    else:
+        first_active = active_indices[0]
+        task_lines[first_active] = promote_to_active(task_lines[first_active])
+        for index in active_indices[1:]:
+            task_lines[index] = demote_to_pending(task_lines[index])
+    return task_lines
+
+
+def normalize_task_loop_text(raw_text: str) -> str:
+    task_lines = normalize_task_lines(raw_text)
+    body = "No active task loop yet." if not task_lines else "\n".join(task_lines)
     return f"# Active Task Loop\nUpdated: {now_timestamp()}\n\n{body}\n"
 
 
-def get_task_loop_status(base_dir: Path, policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    path = get_state_paths(base_dir)["task_loop"]
+def normalize_task_stream_text(
+    raw_text: str,
+    stream_id: str,
+    *,
+    title: str | None = None,
+    state: str = "open",
+) -> str:
+    normalized_id = normalize_stream_id(stream_id)
+    normalized_title = title or stream_title_from_id(normalized_id)
+    normalized_state = str(state or "open").strip().lower()
+    if normalized_state not in {"open", "closed"}:
+        normalized_state = "open"
+    task_lines = normalize_task_lines(raw_text)
+    body = "No active task stream yet." if not task_lines else "\n".join(task_lines)
+    return (
+        "# Task Stream\n"
+        f"ID: {normalized_id}\n"
+        f"Title: {normalized_title}\n"
+        f"State: {normalized_state}\n"
+        f"Updated: {now_timestamp()}\n\n"
+        f"{body}\n"
+    )
+
+
+def parse_task_stream_file(base_dir: Path, path: Path, stale_after_minutes: int) -> dict[str, Any]:
+    stream_id = normalize_stream_id(path.stem)
+    if not path.exists():
+        return {
+            "id": stream_id,
+            "title": stream_title_from_id(stream_id),
+            "state": "open",
+            "path": str(path),
+            "status": "missing",
+            "updated_at": None,
+            "active_step_count": 0,
+            "task_lines": [],
+            "reasons": [f"Task stream {stream_id} is missing."],
+        }
+
+    text = path.read_text(encoding="utf-8")
+    header_id = normalize_stream_id(extract_prefixed_value(text, "ID") or stream_id)
+    title = extract_prefixed_value(text, "Title") or stream_title_from_id(stream_id)
+    state = str(extract_prefixed_value(text, "State") or "open").strip().lower()
+    updated_at = extract_updated_at(text)
+    updated_dt = parse_timestamp(updated_at)
+    task_lines = normalize_task_lines(text)
+    raw_active_count = sum(1 for line in text.splitlines() if ACTIVE_LINE_RE.match(line.strip()))
+    placeholder = "No active task stream yet." in text or not task_lines
+    reasons: list[str] = []
+
+    if header_id != stream_id:
+        reasons.append(f"Task stream id {header_id!r} does not match file name {stream_id!r}.")
+        status = "invalid"
+    elif state not in {"open", "closed"}:
+        reasons.append(f"Task stream {stream_id!r} has invalid state {state!r}.")
+        status = "invalid"
+    elif placeholder:
+        reasons.append(f"Task stream {stream_id!r} has no active task yet.")
+        status = "missing"
+    elif updated_dt is None:
+        reasons.append(f"Task stream {stream_id!r} is missing a valid Updated timestamp.")
+        status = "invalid"
+    elif raw_active_count != 1:
+        reasons.append(
+            f"Task stream {stream_id!r} must have exactly one active step, found {raw_active_count}."
+        )
+        status = "invalid"
+    elif updated_dt < datetime.now().astimezone() - timedelta(minutes=stale_after_minutes):
+        reasons.append(f"Task stream {stream_id!r} is older than the configured freshness threshold.")
+        status = "stale"
+    else:
+        status = "healthy"
+
+    return {
+        "id": stream_id,
+        "title": title,
+        "state": state if state in {"open", "closed"} else "open",
+        "path": str(path),
+        "status": status,
+        "updated_at": updated_at,
+        "active_step_count": raw_active_count,
+        "task_lines": task_lines,
+        "reasons": reasons,
+    }
+
+
+def render_task_summary_text(streams: list[dict[str, Any]], primary_stream_id: str) -> str:
+    lines = [
+        "# Active Task Loop",
+        f"Updated: {now_timestamp()}",
+        "",
+        "Mode: streams",
+        f"Primary stream: {primary_stream_id}",
+        "",
+    ]
+    for stream in streams:
+        state_line = stream["state"]
+        if stream["id"] == primary_stream_id:
+            state_line += " primary"
+        lines.append(f"## {stream['title']}")
+        lines.append(f"State: {state_line}")
+        lines.extend(stream["task_lines"] or ["- [ ] Active: No active step recorded."])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_task_summary(base_dir: Path, primary_stream_id: str | None = None) -> Path:
+    paths = ensure_state_files(base_dir)
+    stream_paths = list_task_stream_paths(base_dir)
+    if not stream_paths:
+        return paths["task_loop"]
+
+    streams: list[dict[str, Any]] = []
+    for path in stream_paths:
+        stream_id = normalize_stream_id(path.stem)
+        text = path.read_text(encoding="utf-8")
+        streams.append(
+            {
+                "id": stream_id,
+                "title": extract_prefixed_value(text, "Title") or stream_title_from_id(stream_id),
+                "state": str(extract_prefixed_value(text, "State") or "open").strip().lower(),
+                "task_lines": normalize_task_lines(text),
+            }
+        )
+
+    current_summary = (
+        paths["task_loop"].read_text(encoding="utf-8") if paths["task_loop"].exists() else ""
+    )
+    resolved_primary = normalize_stream_id(
+        primary_stream_id or extract_primary_stream_id(current_summary) or streams[0]["id"]
+    )
+    if resolved_primary not in {stream["id"] for stream in streams}:
+        resolved_primary = streams[0]["id"]
+
+    paths["task_loop"].write_text(
+        render_task_summary_text(streams, resolved_primary),
+        encoding="utf-8",
+    )
+    return paths["task_loop"]
+
+
+def get_task_state(base_dir: Path, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    paths = get_state_paths(base_dir)
     policy_data = policy or load_policy(base_dir)["data"]
     stale_after = int(policy_data["task_loop"]["stale_after_minutes"])
+    stream_paths = list_task_stream_paths(base_dir)
 
+    if stream_paths:
+        summary_exists = paths["task_loop"].exists()
+        summary_text = paths["task_loop"].read_text(encoding="utf-8") if summary_exists else ""
+        summary_updated_at = extract_updated_at(summary_text)
+        summary_updated_dt = parse_timestamp(summary_updated_at)
+        streams = [
+            parse_task_stream_file(base_dir, path, stale_after_minutes=stale_after)
+            for path in stream_paths
+        ]
+        primary_stream_id = normalize_stream_id(
+            extract_primary_stream_id(summary_text) or streams[0]["id"]
+        )
+        if primary_stream_id not in {stream["id"] for stream in streams}:
+            primary_stream_id = streams[0]["id"]
+        for stream in streams:
+            stream["primary"] = stream["id"] == primary_stream_id
+
+        reasons: list[str] = []
+        for stream in streams:
+            reasons.extend(stream["reasons"])
+
+        if not summary_exists:
+            reasons.append("Task-stream summary file is missing.")
+            status = "invalid"
+        elif summary_updated_dt is None:
+            reasons.append("Task-stream summary timestamp is missing or invalid.")
+            status = "invalid"
+        elif any(stream["status"] == "invalid" for stream in streams):
+            status = "invalid"
+        elif any(stream["status"] == "stale" for stream in streams):
+            status = "stale"
+        elif all(stream["status"] == "missing" for stream in streams):
+            status = "missing"
+        else:
+            status = "healthy"
+
+        return {
+            "path": str(paths["task_loop"]),
+            "exists": summary_exists,
+            "status": status,
+            "updated_at": summary_updated_at,
+            "active_step_count": sum(stream["active_step_count"] for stream in streams),
+            "stale": status == "stale",
+            "placeholder": False,
+            "reasons": reasons,
+            "mode": "streams",
+            "primary_stream_id": primary_stream_id,
+            "stream_count": len(streams),
+            "streams": streams,
+        }
+
+    path = paths["task_loop"]
     if not path.exists():
         return {
             "path": str(path),
@@ -473,49 +736,66 @@ def get_task_loop_status(base_dir: Path, policy: dict[str, Any] | None = None) -
             "stale": False,
             "placeholder": True,
             "reasons": ["active-task-loop.md is missing."],
+            "mode": "legacy",
+            "primary_stream_id": "default",
+            "stream_count": 1,
+            "streams": [],
         }
 
     text = path.read_text(encoding="utf-8")
     updated_at = extract_updated_at(text)
     updated_dt = parse_timestamp(updated_at)
-    active_step_count = sum(
-        1 for line in text.splitlines() if ACTIVE_LINE_RE.match(line.strip())
-    )
-    placeholder = "No active task loop yet." in text or not text.strip()
+    task_lines = normalize_task_lines(text)
+    raw_active_count = sum(1 for line in text.splitlines() if ACTIVE_LINE_RE.match(line.strip()))
+    placeholder = "No active task loop yet." in text or not task_lines
     reasons: list[str] = []
 
     if placeholder:
         status = "missing"
-        stale = False
         reasons.append("Task loop has not been initialized with a real active step.")
     elif updated_dt is None:
         status = "invalid"
-        stale = True
         reasons.append("Task loop timestamp is missing or invalid.")
-    elif active_step_count != 1:
+    elif raw_active_count != 1:
         status = "invalid"
-        stale = True
-        reasons.append(
-            f"Task loop must have exactly one active step, found {active_step_count}."
-        )
+        reasons.append(f"Task loop must have exactly one active step, found {raw_active_count}.")
     elif updated_dt < datetime.now().astimezone() - timedelta(minutes=stale_after):
         status = "stale"
-        stale = True
         reasons.append("Task loop timestamp is older than the configured freshness threshold.")
     else:
         status = "healthy"
-        stale = False
 
     return {
         "path": str(path),
         "exists": True,
         "status": status,
         "updated_at": updated_at,
-        "active_step_count": active_step_count,
-        "stale": stale,
+        "active_step_count": raw_active_count,
+        "stale": status == "stale",
         "placeholder": placeholder,
         "reasons": reasons,
+        "mode": "legacy",
+        "primary_stream_id": "default",
+        "stream_count": 1,
+        "streams": [
+            {
+                "id": "default",
+                "title": "Default",
+                "state": "open",
+                "path": str(path),
+                "status": status,
+                "updated_at": updated_at,
+                "active_step_count": raw_active_count,
+                "task_lines": task_lines,
+                "reasons": list(reasons),
+                "primary": True,
+            }
+        ],
     }
+
+
+def get_task_loop_status(base_dir: Path, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    return get_task_state(base_dir, policy)
 
 
 def load_verification_entries(base_dir: Path) -> dict[str, Any]:
@@ -577,6 +857,37 @@ def validate_verification_entry(entry: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def build_stream_verification_coverage(
+    entries: list[dict[str, Any]],
+    task_state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    streams = task_state.get("streams", [])
+    if not streams:
+        return [], []
+
+    coverage: list[dict[str, Any]] = []
+    uncovered_open_streams: list[str] = []
+    for stream in streams:
+        stream_id = str(stream.get("id") or "default")
+        covered = False
+        for entry in entries:
+            entry_stream_id = str(entry.get("stream_id") or "default")
+            if entry_stream_id == stream_id:
+                covered = True
+                break
+        coverage.append(
+            {
+                "id": stream_id,
+                "title": stream.get("title") or stream_id,
+                "state": stream.get("state") or "open",
+                "covered": covered,
+            }
+        )
+        if str(stream.get("state") or "open") == "open" and not covered:
+            uncovered_open_streams.append(stream_id)
+    return coverage, uncovered_open_streams
+
+
 def get_verification_state(
     base_dir: Path,
     task_loop_status: dict[str, Any] | None = None,
@@ -588,6 +899,7 @@ def get_verification_state(
     task_status = task_loop_status or get_task_loop_status(base_dir)
     task_updated = parse_timestamp(task_status.get("updated_at"))
     reasons = list(loaded["invalid_reasons"])
+    stream_coverage, uncovered_open_streams = build_stream_verification_coverage(entries, task_status)
 
     if loaded["invalid_lines"] > 0:
         status = "invalid"
@@ -607,6 +919,9 @@ def get_verification_state(
         "invalid_reasons": reasons,
         "latest_timestamp": (latest_entry or {}).get("timestamp"),
         "latest_verdict": (latest_entry or {}).get("verdict"),
+        "stream_coverage": stream_coverage,
+        "uncovered_open_streams": uncovered_open_streams,
+        "coverage_gap": bool(uncovered_open_streams),
     }
 
 
@@ -926,10 +1241,62 @@ def should_refresh_memory(
     )
 
 
-def update_task_loop(base_dir: Path, raw_text: str) -> Path:
-    path = ensure_state_files(base_dir)["task_loop"]
-    path.write_text(normalize_task_loop_text(raw_text), encoding="utf-8")
-    return path
+def migrate_legacy_task_loop_to_streams(base_dir: Path) -> str | None:
+    paths = ensure_state_files(base_dir)
+    if list_task_stream_paths(base_dir):
+        return None
+    if not paths["task_loop"].exists():
+        return None
+
+    legacy_text = paths["task_loop"].read_text(encoding="utf-8")
+    if "No active task loop yet." in legacy_text or not normalize_task_lines(legacy_text):
+        return None
+
+    default_stream = get_task_stream_path(base_dir, "default")
+    default_stream.write_text(
+        normalize_task_stream_text(legacy_text, "default", title="Default"),
+        encoding="utf-8",
+    )
+    return "default"
+
+
+def update_task_loop(
+    base_dir: Path,
+    raw_text: str,
+    *,
+    stream_id: str | None = None,
+    set_primary: bool = False,
+) -> Path:
+    paths = ensure_state_files(base_dir)
+    had_streams = bool(list_task_stream_paths(base_dir))
+
+    if stream_id is None and not had_streams:
+        paths["task_loop"].write_text(normalize_task_loop_text(raw_text), encoding="utf-8")
+        return paths["task_loop"]
+
+    normalized_stream_id = normalize_stream_id(stream_id or "default")
+    primary_stream_id = get_task_state(base_dir).get("primary_stream_id", normalized_stream_id)
+    migrated_primary = migrate_legacy_task_loop_to_streams(base_dir)
+    if migrated_primary and not set_primary and normalized_stream_id != migrated_primary:
+        primary_stream_id = migrated_primary
+
+    stream_path = get_task_stream_path(base_dir, normalized_stream_id)
+    stream_path.write_text(
+        normalize_task_stream_text(
+            raw_text,
+            normalized_stream_id,
+            title=stream_title_from_id(normalized_stream_id),
+        ),
+        encoding="utf-8",
+    )
+
+    if set_primary or not had_streams and migrated_primary is None:
+        primary_stream_id = normalized_stream_id
+    if not primary_stream_id:
+        primary_stream_id = normalized_stream_id
+
+    write_task_summary(base_dir, primary_stream_id)
+    return stream_path
 
 
 def normalize_section_name(section_name: str | None) -> str:
@@ -1305,6 +1672,258 @@ def get_memory_sync_state(base_dir: Path) -> dict[str, Any]:
     }
 
 
+def validate_reasoning_hotspot_entry(entry: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for key in REASONING_HOTSPOT_REQUIRED_KEYS:
+        if key not in entry:
+            reasons.append(f"Missing required key: {key}")
+
+    timestamp = entry.get("timestamp")
+    if timestamp is not None and parse_timestamp(str(timestamp)) is None:
+        reasons.append("timestamp is not a valid ISO 8601 value.")
+
+    for key in ("kind", "summary", "source"):
+        value = str(entry.get(key, "")).strip()
+        if not value:
+            reasons.append(f"{key} must be non-empty.")
+
+    related_items = entry.get("related_items")
+    if related_items is not None:
+        if not isinstance(related_items, list):
+            reasons.append("related_items must be a JSON array.")
+        elif any(not str(item).strip() for item in related_items):
+            reasons.append("related_items entries must be non-empty strings.")
+
+    recommended_skills = entry.get("recommended_skills")
+    if recommended_skills is not None:
+        if not isinstance(recommended_skills, list):
+            reasons.append("recommended_skills must be a JSON array.")
+        elif any(not str(item).strip() for item in recommended_skills):
+            reasons.append("recommended_skills entries must be non-empty strings.")
+
+    questions = entry.get("questions")
+    if questions is not None:
+        if not isinstance(questions, list):
+            reasons.append("questions must be a JSON array.")
+        elif any(not str(item).strip() for item in questions):
+            reasons.append("questions entries must be non-empty strings.")
+
+    return reasons
+
+
+def load_reasoning_hotspot_entries(base_dir: Path) -> dict[str, Any]:
+    path = get_state_paths(base_dir)["reasoning_hotspots"]
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "entries": [],
+            "invalid_lines": 0,
+            "invalid_reasons": [],
+            "line_records": [],
+        }
+
+    entries: list[dict[str, Any]] = []
+    invalid_lines = 0
+    invalid_reasons: list[str] = []
+    line_records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: invalid JSON ({exc}).")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        if not isinstance(parsed, dict):
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: entry must decode to a JSON object.")
+            line_records.append({"raw": line, "valid": False})
+            continue
+
+        reasons = validate_reasoning_hotspot_entry(parsed)
+        if reasons:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: {'; '.join(reasons)}")
+            line_records.append({"raw": line, "valid": False})
+            continue
+
+        entry = dict(parsed)
+        entry.setdefault("timestamp", now_timestamp())
+        entries.append(entry)
+        line_records.append({"raw": line, "valid": True, "entry": entry})
+
+    return {
+        "path": str(path),
+        "exists": True,
+        "entries": entries,
+        "invalid_lines": invalid_lines,
+        "invalid_reasons": invalid_reasons,
+        "line_records": line_records,
+    }
+
+
+def should_skip_recent_duplicate_hotspot(
+    existing_entries: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    *,
+    window_minutes: int = HOTSPOT_DEDUPE_WINDOW_MINUTES,
+) -> bool:
+    cutoff = datetime.now().astimezone() - timedelta(minutes=window_minutes)
+    candidate_kind = str(candidate.get("kind", "")).strip()
+    candidate_summary = str(candidate.get("summary", "")).strip()
+    candidate_source = str(candidate.get("source", "")).strip()
+    candidate_related = [str(item).strip() for item in candidate.get("related_items", [])]
+
+    for entry in reversed(existing_entries):
+        entry_timestamp = parse_timestamp(str(entry.get("timestamp", "")))
+        if entry_timestamp is None or entry_timestamp < cutoff:
+            continue
+        if str(entry.get("kind", "")).strip() != candidate_kind:
+            continue
+        if str(entry.get("summary", "")).strip() != candidate_summary:
+            continue
+        if str(entry.get("source", "")).strip() != candidate_source:
+            continue
+        existing_related = [str(item).strip() for item in entry.get("related_items", [])]
+        if existing_related != candidate_related:
+            continue
+        return True
+    return False
+
+
+def dedupe_non_empty_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in deduped:
+            deduped.append(text)
+    return deduped
+
+
+def get_recurring_reasoning_hotspot_skills(kind: str) -> list[str]:
+    return list(HOTSPOT_RECURRING_SKILLS.get(kind, ("execution-task-loop",)))
+
+
+def build_recent_reasoning_hotspot_entries(
+    entries: list[dict[str, Any]],
+    *,
+    limit: int = HOTSPOT_HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
+    recent: list[dict[str, Any]] = []
+    for entry in reversed(entries):
+        recent.append(
+            {
+                "timestamp": str(entry.get("timestamp") or ""),
+                "kind": str(entry.get("kind") or ""),
+                "summary": str(entry.get("summary") or ""),
+                "source": str(entry.get("source") or ""),
+            }
+        )
+        if len(recent) >= limit:
+            break
+    return recent
+
+
+def build_recurring_reasoning_hotspot_summary(
+    entries: list[dict[str, Any]],
+    *,
+    active_kinds: list[str] | None = None,
+    window_days: int = HOTSPOT_RECURRING_WINDOW_DAYS,
+    threshold: int = HOTSPOT_RECURRING_THRESHOLD,
+) -> list[dict[str, Any]]:
+    cutoff = datetime.now().astimezone() - timedelta(days=window_days)
+    allowed_kinds = set(dedupe_non_empty_strings(active_kinds or []))
+    counts: dict[str, int] = {}
+    latest_seen: dict[str, str] = {}
+    latest_summary: dict[str, str] = {}
+
+    for entry in entries:
+        timestamp = parse_timestamp(str(entry.get("timestamp", "")))
+        if timestamp is None or timestamp < cutoff:
+            continue
+        kind = str(entry.get("kind") or "").strip()
+        if not kind:
+            continue
+        if allowed_kinds and kind not in allowed_kinds:
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
+        latest_seen[kind] = str(entry.get("timestamp") or "")
+        latest_summary[kind] = str(entry.get("summary") or "")
+
+    recurring: list[dict[str, Any]] = []
+    for kind, count in counts.items():
+        if count < threshold:
+            continue
+        recurring.append(
+            {
+                "kind": kind,
+                "count": count,
+                "window_days": window_days,
+                "last_seen": latest_seen.get(kind),
+                "summary": (
+                    f"The hotspot `{kind}` recurred {count} times in the last {window_days} days, "
+                    "so this likely needs stronger workflow escalation than a quick checkpoint alone."
+                ),
+                "latest_summary": latest_summary.get(kind),
+                "recommended_skills": get_recurring_reasoning_hotspot_skills(kind),
+            }
+        )
+
+    recurring.sort(key=lambda item: (-int(item["count"]), str(item["kind"])))
+    return recurring
+
+
+def append_reasoning_hotspot_entry(
+    base_dir: Path,
+    entry: dict[str, Any],
+    *,
+    suppress_recent_duplicates: bool = False,
+) -> Path | None:
+    payload = dict(entry)
+    payload.setdefault("timestamp", now_timestamp())
+    reasons = validate_reasoning_hotspot_entry(payload)
+    if reasons:
+        raise SystemExit("Invalid reasoning hotspot entry:\n- " + "\n- ".join(reasons))
+
+    path = ensure_state_files(base_dir)["reasoning_hotspots"]
+    if suppress_recent_duplicates:
+        loaded = load_reasoning_hotspot_entries(base_dir)
+        if should_skip_recent_duplicate_hotspot(loaded["entries"], payload):
+            return None
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    return path
+
+
+def get_reasoning_hotspot_state(base_dir: Path) -> dict[str, Any]:
+    loaded = load_reasoning_hotspot_entries(base_dir)
+    latest = loaded["entries"][-1] if loaded["entries"] else None
+    recent_entries = build_recent_reasoning_hotspot_entries(loaded["entries"])
+    recurring_hotspots = build_recurring_reasoning_hotspot_summary(loaded["entries"])
+    if not loaded["exists"]:
+        status = "missing"
+    elif loaded["invalid_lines"] > 0:
+        status = "invalid"
+    else:
+        status = "healthy"
+    return {
+        "path": loaded["path"],
+        "exists": loaded["exists"],
+        "status": status,
+        "entry_count": len(loaded["entries"]),
+        "invalid_lines": loaded["invalid_lines"],
+        "invalid_reasons": loaded["invalid_reasons"],
+        "latest_timestamp": (latest or {}).get("timestamp"),
+        "latest_kind": (latest or {}).get("kind"),
+        "recent_entries": recent_entries,
+        "recurring_hotspots": recurring_hotspots,
+    }
+
+
 def append_verification_entry(base_dir: Path, entry: dict[str, Any]) -> Path:
     path = ensure_state_files(base_dir)["verification_log"]
     serialized = json.dumps(entry, sort_keys=True)
@@ -1331,6 +1950,7 @@ def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
     shared_memory = get_shared_memory_status(base_dir)
     memory_candidates = get_memory_candidate_state(base_dir)
     memory_sync = get_memory_sync_state(base_dir)
+    reasoning_hotspots = get_reasoning_hotspot_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy_info["data"])
     verification = get_verification_state(base_dir, task_loop)
     buglog = get_buglog_state(base_dir)
@@ -1342,6 +1962,7 @@ def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
         "shared_memory": shared_memory,
         "memory_candidates": memory_candidates,
         "memory_sync": memory_sync,
+        "reasoning_hotspots": reasoning_hotspots,
         "buglog": buglog,
         "policy": policy_info,
         "task_loop": task_loop,

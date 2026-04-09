@@ -11,6 +11,8 @@ Turn a coding request into a decision-complete implementation plan. Explore the 
 
 This is a planning-only skill. Stay read-only while it is active. Do not start implementing, do not write files, and do not quietly turn unresolved design choices into implementation work.
 
+The upfront plan is the anchor for the rest of the task. Later hotspot-triggered micro reasoning should refine or refresh that plan when reality changes, not replace the initial planning pass.
+
 ## Planning Stance
 
 - Read the repo before planning.
@@ -39,6 +41,7 @@ This is a planning-only skill. Stay read-only while it is active. Do not start i
    - Include explicit tests and acceptance scenarios.
    - Include assumptions and defaults chosen where needed.
    - End with the 3-5 files most critical to implementation when the task is non-trivial.
+   - Make it easy for later execution-time micro reasoning to update the plan without discarding it.
 
 ## Output Requirements
 

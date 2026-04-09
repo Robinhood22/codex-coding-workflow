@@ -94,6 +94,8 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         workflow_state = "missing_task_loop"
 
     verification_state = verification_summary["status"]
+    task_loop_mode = change_scope.get("task_loop_mode", "legacy")
+    task_stream_count = int(change_scope.get("task_stream_count", 1) or 1)
     risk_level = change_scope.get("risk_level", "low")
     memory_status = change_scope.get("memory_status", "missing")
     shared_memory_status = change_scope.get("shared_memory_status", "missing")
@@ -137,6 +139,13 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         blockers.append(
             f"{memory_candidates_pending} queued memory candidate(s) still need auto-refresh promotion."
         )
+    if change_scope.get("micro_reasoning_escalation_recommended"):
+        blockers.append(
+            "Recurring hotspot patterns suggest the current plan or verification workflow needs escalation before shipping."
+        )
+    for blocker in verification_summary.get("blockers", []):
+        if blocker not in blockers:
+            blockers.append(blocker)
 
     recent_log = run_git(["log", "--oneline", "-n", "5"], repo_root).stdout.strip().splitlines()
 
@@ -154,6 +163,8 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         "recent_commits": recent_log,
         "risk_level": risk_level,
         "workflow_state": workflow_state,
+        "task_loop_mode": task_loop_mode,
+        "task_stream_count": task_stream_count,
         "verification_state": verification_state,
         "memory_state": memory_status,
         "shared_memory_state": shared_memory_status,
@@ -161,6 +172,7 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         "memory_candidates_pending": memory_candidates_pending,
         "memory_sync_state": memory_sync_status,
         "policy_state": policy_status,
+        "recurring_reasoning_hotspots": change_scope.get("recurring_reasoning_hotspots", []),
         "verification_summary": verification_summary,
         "change_scope": change_scope,
         "blockers": blockers,
@@ -182,6 +194,8 @@ def render_text(summary: dict[str, Any]) -> str:
         f"{summary['unstaged_count']} unstaged, "
         f"{summary['untracked_count']} untracked",
         f"Workflow state: {summary.get('workflow_state', 'unknown')}",
+        f"Task loop mode: {summary.get('task_loop_mode', 'unknown')}",
+        f"Task streams: {summary.get('task_stream_count', 0)}",
         f"Verification state: {summary.get('verification_state', 'unknown')}",
         f"Memory state: {summary.get('memory_state', 'unknown')}",
         f"Shared memory state: {summary.get('shared_memory_state', 'unknown')}",

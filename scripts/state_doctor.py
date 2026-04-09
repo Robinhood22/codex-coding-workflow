@@ -25,14 +25,17 @@ from workflow_state import (
     load_buglog_entries,
     load_memory_candidate_entries,
     load_memory_sync_entries,
+    load_reasoning_hotspot_entries,
     load_policy,
     load_verification_entries,
     normalize_memory_document_text,
     normalize_memory_text,
     normalize_task_loop_text,
+    normalize_task_stream_text,
     now_timestamp,
     parse_timestamp,
     serialize_policy,
+    write_task_summary,
 )
 
 
@@ -508,6 +511,7 @@ def build_check_report(base_dir: Path) -> dict[str, Any]:
         "shared_memory": summary["shared_memory"],
         "memory_candidates": summary["memory_candidates"],
         "memory_sync": summary["memory_sync"],
+        "reasoning_hotspots": summary["reasoning_hotspots"],
         "buglog": summary["buglog"],
         "policy": {
             "path": summary["policy"]["path"],
@@ -596,8 +600,35 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
         backup_path = backup_state_file(base_dir, paths["task_loop"])
         if backup_path:
             backups.append(backup_path)
-        current = paths["task_loop"].read_text(encoding="utf-8") if paths["task_loop"].exists() else ""
-        paths["task_loop"].write_text(normalize_task_loop_text(current), encoding="utf-8")
+        task_loop_info = before["files"]["task_loop"]
+        if task_loop_info.get("mode") == "streams":
+            for stream in task_loop_info.get("streams", []):
+                if stream.get("status") not in {"invalid", "stale"}:
+                    continue
+                stream_path = Path(str(stream["path"]))
+                stream_backup = backup_state_file(base_dir, stream_path)
+                if stream_backup:
+                    backups.append(stream_backup)
+                current_stream = (
+                    stream_path.read_text(encoding="utf-8") if stream_path.exists() else ""
+                )
+                stream_path.write_text(
+                    normalize_task_stream_text(
+                        current_stream,
+                        str(stream.get("id") or "default"),
+                        title=str(stream.get("title") or "Default"),
+                        state=str(stream.get("state") or "open"),
+                    ),
+                    encoding="utf-8",
+                )
+            write_task_summary(base_dir, task_loop_info.get("primary_stream_id"))
+        else:
+            current = (
+                paths["task_loop"].read_text(encoding="utf-8")
+                if paths["task_loop"].exists()
+                else ""
+            )
+            paths["task_loop"].write_text(normalize_task_loop_text(current), encoding="utf-8")
         repaired.append("task_loop")
         if task_status == "stale":
             manual_review_required.append("task_loop")
@@ -667,6 +698,27 @@ def repair_state(base_dir: Path) -> dict[str, Any]:
             payload += "\n"
         paths["memory_sync_log"].write_text(payload, encoding="utf-8")
         repaired.append("memory_sync")
+
+    reasoning_hotspot_loaded = load_reasoning_hotspot_entries(base_dir)
+    if reasoning_hotspot_loaded["invalid_lines"] > 0:
+        backup_path = backup_state_file(base_dir, paths["reasoning_hotspots"])
+        if backup_path:
+            backups.append(backup_path)
+        serialized = [
+            json.dumps(entry, sort_keys=True)
+            for entry in reasoning_hotspot_loaded["entries"]
+        ]
+        payload = "\n".join(serialized)
+        if payload:
+            payload += "\n"
+        paths["reasoning_hotspots"].write_text(payload, encoding="utf-8")
+        repaired.append("reasoning_hotspots")
+        data_loss.append(
+            "reasoning_hotspots: dropped "
+            f"{reasoning_hotspot_loaded['invalid_lines']} invalid line(s) while preserving "
+            f"{len(reasoning_hotspot_loaded['entries'])} valid entr"
+            f"{'y' if len(reasoning_hotspot_loaded['entries']) == 1 else 'ies'}."
+        )
 
     stale_after_minutes = get_team_stale_after_minutes(base_dir)
     for run in before["teams"]["runs"]:

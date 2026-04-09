@@ -33,7 +33,7 @@ def load_text_argument(inline_text: str | None, file_path: str | None) -> str:
     return ""
 
 
-def render_text(summary: dict[str, Any]) -> str:
+def render_text(summary: dict[str, Any], *, list_streams: bool = False) -> str:
     lines = [
         f"Workspace root: {summary['workspace_root']}",
         f"State dir: {summary['state_dir']}",
@@ -41,6 +41,7 @@ def render_text(summary: dict[str, Any]) -> str:
         f"Shared memory: {summary['shared_memory']['status']}",
         f"Memory candidates: {summary['memory_candidates']['status']} ({summary['memory_candidates']['pending_count']} pending)",
         f"Memory sync: {summary['memory_sync']['status']}",
+        f"Reasoning hotspots: {summary['reasoning_hotspots']['status']} ({summary['reasoning_hotspots']['entry_count']} entries)",
         f"Bug log: {summary['buglog']['status']} ({summary['buglog']['entry_count']} entries)",
         f"Policy: {summary['policy']['status']}",
         f"Task loop: {summary['task_loop']['status']}",
@@ -69,6 +70,17 @@ def render_text(summary: dict[str, Any]) -> str:
         if auto_refresh.get("blocked_shared"):
             lines.append(
                 f"Blocked shared entries: {len(auto_refresh['blocked_shared'])}"
+            )
+
+    if list_streams and summary["task_loop"].get("streams"):
+        lines.append("Streams:")
+        primary_stream_id = summary["task_loop"].get("primary_stream_id")
+        for stream in summary["task_loop"]["streams"]:
+            state_bits = [str(stream.get("state") or "open")]
+            if stream.get("id") == primary_stream_id:
+                state_bits.append("primary")
+            lines.append(
+                f"- {stream.get('id')}: {stream.get('status')} ({' '.join(state_bits)})"
             )
 
     return "\n".join(lines)
@@ -134,6 +146,17 @@ def main() -> int:
         action="store_true",
         help="Promote queued memory candidates and mirror shared memory into local memory.",
     )
+    parser.add_argument(
+        "--stream",
+        type=str,
+        default=None,
+        help="Task stream id to update when using --set-task-loop or --task-loop-file.",
+    )
+    parser.add_argument(
+        "--list-streams",
+        action="store_true",
+        help="Include task stream status in --show output.",
+    )
     parser.add_argument("--set-task-loop", type=str, default=None, help="Replace the active task loop with inline text.")
     parser.add_argument("--task-loop-file", type=str, default=None, help="Load task loop content from a file.")
     parser.add_argument(
@@ -195,7 +218,7 @@ def main() -> int:
         else ""
     )
     if task_loop_text.strip():
-        update_task_loop(base_dir, task_loop_text)
+        update_task_loop(base_dir, task_loop_text, stream_id=args.stream)
 
     verification_payload = (
         load_text_argument(
@@ -231,7 +254,7 @@ def main() -> int:
         or task_loop_text.strip()
         or verification_payload.strip()
     ):
-        print(render_text(summary))
+        print(render_text(summary, list_streams=args.list_streams))
     else:
         print(
             "No operation requested. Use --show, --init, --append-memory, "

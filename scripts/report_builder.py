@@ -56,9 +56,32 @@ def flatten_blockers(items: list[str]) -> list[str]:
     return [item for item in items if item]
 
 
+def has_stream_coverage_gap(verification_summary: dict[str, Any]) -> bool:
+    return any(
+        not item.get("covered", False) and str(item.get("state") or "open") == "open"
+        for item in verification_summary.get("stream_coverage", [])
+    )
+
+
 def filter_real_memory_lines(section_name: str, lines: list[str]) -> list[str]:
     defaults = set(get_default_section_lines(section_name))
     return [line for line in lines if line.strip() and line.strip() not in defaults]
+
+
+def format_skill_list(skills: list[str]) -> str:
+    rendered = [f"`{skill}`" for skill in skills if str(skill).strip()]
+    return ", ".join(rendered)
+
+
+def format_recent_hotspot_history(entries: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for entry in entries:
+        timestamp = str(entry.get("timestamp") or "unknown-time")
+        kind = str(entry.get("kind") or "unknown-kind")
+        source = str(entry.get("source") or "unknown-source")
+        summary = str(entry.get("summary") or "").strip()
+        lines.append(f"- {timestamp} | `{kind}` via `{source}`: {summary}")
+    return lines
 
 
 def summarize_latest_team_run(base_dir: Path) -> dict[str, Any] | None:
@@ -107,6 +130,16 @@ def build_next_actions(
     state: dict[str, Any],
 ) -> list[str]:
     actions: list[str] = []
+    if change_scope.get("micro_reasoning_recommended"):
+        actions.append(
+            "Run a short hotspot-triggered micro-reasoning checkpoint while keeping the initial plan as the anchor."
+        )
+    if change_scope.get("micro_reasoning_escalation_recommended"):
+        escalated_skills = format_skill_list(change_scope.get("escalated_recommended_skills", []))
+        if escalated_skills:
+            actions.append(f"Escalate recurring hotspot patterns with {escalated_skills}.")
+        else:
+            actions.append("Escalate recurring hotspot patterns beyond a quick checkpoint.")
     if change_scope.get("state_repair_needed"):
         actions.append("Run workflow-state-repair before relying on repo-local workflow state.")
     if state.get("shared_memory", {}).get("status") == "invalid":
@@ -115,12 +148,16 @@ def build_next_actions(
         actions.append("Run project-memory-sync auto-refresh to promote queued memory candidates.")
     if state.get("memory_sync", {}).get("status") == "invalid":
         actions.append("Repair the memory sync log before trusting automatic/shared memory state.")
+    if state.get("reasoning_hotspots", {}).get("status") == "invalid":
+        actions.append("Repair the reasoning hotspot log before relying on durable micro-reasoning recall.")
     if state.get("buglog", {}).get("status") == "invalid":
         actions.append("Repair bug memory before relying on historical bug-fix recall.")
     if change_scope.get("task_loop_status") in {"missing", "stale", "invalid"}:
         actions.append("Refresh the active task loop so it matches the current implementation.")
     if verification_summary.get("status") in {"missing", "stale", "invalid"}:
         actions.append("Run verify-change or refresh verification evidence before review or handoff.")
+    elif has_stream_coverage_gap(verification_summary):
+        actions.append("Refresh verification so every open task stream has current coverage.")
     if branch_summary and branch_summary.get("upstream") is None:
         actions.append("Set an upstream branch before treating this as ready to land.")
     if latest_team_run and latest_team_run.get("blockers"):
@@ -155,10 +192,13 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         "## Status",
         f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
         f"- Task loop: {state['task_loop']['status']}",
+        f"- Task loop mode: {state['task_loop'].get('mode', 'legacy')}",
+        f"- Task streams: {state['task_loop'].get('stream_count', 1)}",
         f"- Verification: {verification['status']}",
         f"- Memory: {state['memory']['status']}",
         f"- Shared memory: {state['shared_memory']['status']}",
         f"- Memory candidates: {state['memory_candidates']['pending_count']}",
+        f"- Reasoning hotspots: {state['reasoning_hotspots']['status']} ({state['reasoning_hotspots']['entry_count']})",
         f"- Policy: {state['policy']['status']}",
         "",
         "## Change Scope",
@@ -181,9 +221,35 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
             f"- Invalid lines: {verification.get('invalid_lines', 0)}",
         ]
     )
+    if verification.get("stream_coverage"):
+        lines.append("- Stream coverage:")
+        lines.extend(
+            [
+                f"  - {item['id']}: {'covered' if item['covered'] else 'missing'}"
+                for item in verification["stream_coverage"]
+            ]
+        )
     if verification.get("blockers"):
         lines.append("- Verification blockers:")
         lines.extend([f"  - {item}" for item in verification["blockers"]])
+
+    if change_scope.get("reasoning_hotspots"):
+        lines.extend(["", "## Active Hotspots"])
+        lines.extend(
+            [f"- {item['summary']}" for item in change_scope["reasoning_hotspots"]]
+        )
+    if change_scope.get("recurring_reasoning_hotspots"):
+        lines.extend(["", "## Recurring Hotspots"])
+        for item in change_scope["recurring_reasoning_hotspots"]:
+            skill_text = format_skill_list(item.get("recommended_skills", []))
+            if skill_text:
+                lines.append(f"- {item['summary']} Escalate with: {skill_text}.")
+            else:
+                lines.append(f"- {item['summary']}")
+    recent_hotspots = state["reasoning_hotspots"].get("recent_entries", [])
+    if recent_hotspots:
+        lines.extend(["", "## Recent Hotspot History"])
+        lines.extend(format_recent_hotspot_history(recent_hotspots))
 
     lines.extend(["", "## Latest Team Run"])
     if latest_team_run:
@@ -201,7 +267,10 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         lines.append("- No team runs recorded.")
 
     lines.extend(["", "## Blockers"])
-    blockers = branch_summary["blockers"] if branch_summary else ["No git repository detected."]
+    blockers = list(branch_summary["blockers"]) if branch_summary else ["No git repository detected."]
+    for blocker in verification.get("blockers", []):
+        if blocker not in blockers:
+            blockers.append(blocker)
     lines.extend([f"- {blocker}" for blocker in blockers])
 
     lines.extend(["", "## Recommended Next Actions"])
@@ -258,6 +327,8 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         "## What Changed",
         f"- Risk level: {change_scope.get('risk_level', 'unknown')}",
         f"- Changed files: {change_scope.get('changed_file_count', 0)}",
+        f"- Task loop mode: {state['task_loop'].get('mode', 'legacy')}",
+        f"- Task streams: {state['task_loop'].get('stream_count', 1)}",
     ]
     changed_files = change_scope.get("changed_files", [])
     if changed_files:
@@ -272,11 +343,38 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
             f"- Latest timestamp: {verification.get('latest_timestamp') or 'none'}",
             f"- Shared memory: {state['shared_memory']['status']}",
             f"- Memory candidates: {state['memory_candidates']['pending_count']}",
+            f"- Reasoning hotspots: {state['reasoning_hotspots']['status']} ({state['reasoning_hotspots']['entry_count']})",
         ]
     )
+    if verification.get("stream_coverage"):
+        lines.append("- Stream coverage:")
+        lines.extend(
+            [
+                f"  - {item['id']}: {'covered' if item['covered'] else 'missing'}"
+                for item in verification["stream_coverage"]
+            ]
+        )
     if verification.get("blockers"):
         lines.append("- Verification blockers:")
         lines.extend([f"  - {item}" for item in verification["blockers"]])
+
+    if change_scope.get("reasoning_hotspots"):
+        lines.extend(["", "## Active Hotspots"])
+        lines.extend(
+            [f"- {item['summary']}" for item in change_scope["reasoning_hotspots"]]
+        )
+    if change_scope.get("recurring_reasoning_hotspots"):
+        lines.extend(["", "## Recurring Hotspots"])
+        for item in change_scope["recurring_reasoning_hotspots"]:
+            skill_text = format_skill_list(item.get("recommended_skills", []))
+            if skill_text:
+                lines.append(f"- {item['summary']} Escalate with: {skill_text}.")
+            else:
+                lines.append(f"- {item['summary']}")
+    recent_hotspots = state["reasoning_hotspots"].get("recent_entries", [])
+    if recent_hotspots:
+        lines.extend(["", "## Recent Hotspot History"])
+        lines.extend(format_recent_hotspot_history(recent_hotspots))
 
     lines.extend(["", "## Latest Team Run"])
     if latest_team_run:
@@ -294,6 +392,7 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
     lines.extend(["", "## What Is Still Open"])
     open_items = flatten_blockers(
         (branch_summary["blockers"] if branch_summary else [])
+        + verification.get("blockers", [])
         + state["task_loop"].get("reasons", [])
         + (latest_team_run["blockers"] if latest_team_run else [])
     )

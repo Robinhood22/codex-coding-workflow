@@ -11,6 +11,8 @@ Use this skill to keep active coding work organized. Standardize when to create 
 
 Prefer existing Codex task primitives when they are available. Mirror the same discipline in `.codex-workflows/active-task-loop.md` so the repo keeps an inspectable source of truth.
 
+Treat upfront planning and hotspot-triggered micro reasoning as complementary. The initial plan stays the anchor; micro reasoning is the short in-flight checkpoint that helps the agent adapt when uncertainty or scope drift appears during execution.
+
 ## Operating Rules
 
 - Exactly one step may be active at a time.
@@ -31,6 +33,11 @@ Prefer existing Codex task primitives when they are available. Mirror the same d
    - Do not mark a step complete if verification for that step is still missing.
    - Remove or rewrite stale tasks when the plan changes.
    - Do not preserve outdated steps just because they were once written down.
+   - When a hotspot is detected, pause for a short micro-reasoning checkpoint before the next edit:
+     - what changed in your understanding
+     - what is now least certain
+     - whether the task loop or task streams should change
+     - what the smallest next edit or verification probe should be
 5. Keep `.codex-workflows/active-task-loop.md` current.
    - Initialize state first if needed:
 
@@ -50,6 +57,7 @@ Refresh the task loop aggressively when the implementation stops matching the ol
 - a task loop that is stale or invalid
 - significant scope changes discovered during exploration or coding
 - new validation or follow-up steps created by failing checks
+- repeated rewrites of the same file or uncovered open task streams
 
 If the plugin script is available in a repo-local install, use it to sanity-check the current change scope:
 

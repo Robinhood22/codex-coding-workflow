@@ -1,6 +1,6 @@
 {
   "name": "codex-coding-workflows",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Add agentic code review, planning, task-loop discipline, adversarial verification, review-ready summaries, handoff summaries, and ship-readiness workflows to Codex.",
   "author": {
     "name": "OpenAI",

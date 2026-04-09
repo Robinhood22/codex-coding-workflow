@@ -17,15 +17,7 @@ def build_policy_review(base_dir: Path, intent: str) -> dict[str, Any]:
     risk_level = scope.get("risk_level", "low")
     verification_required = verification_required_for(risk_level, policy)
 
-    next_skills: list[str] = []
-    if scope.get("task_loop_needed") or scope.get("task_loop_stale"):
-        next_skills.append("execution-task-loop")
-    if scope.get("memory_refresh_needed"):
-        next_skills.append("project-memory-sync")
-    if risk_level in {"medium", "high"}:
-        next_skills.append("policy-risk-check")
-    if verification_required:
-        next_skills.append("verify-change")
+    next_skills: list[str] = list(scope.get("recommended_skills", []))
     if intent == "ship":
         next_skills.append("ship-readiness-audit")
 
@@ -39,6 +31,13 @@ def build_policy_review(base_dir: Path, intent: str) -> dict[str, Any]:
         "risk_level": risk_level,
         "reasons": scope.get("risk_reasons", []),
         "verification_required": verification_required,
+        "micro_reasoning_recommended": scope.get("micro_reasoning_recommended", False),
+        "reasoning_hotspots": scope.get("reasoning_hotspots", []),
+        "micro_reasoning_escalation_recommended": scope.get(
+            "micro_reasoning_escalation_recommended",
+            False,
+        ),
+        "recurring_reasoning_hotspots": scope.get("recurring_reasoning_hotspots", []),
         "memory_refresh_needed": scope.get("memory_refresh_needed", False),
         "task_loop_stale": scope.get("task_loop_stale", False),
         "recommended_skills": deduped_skills,
@@ -66,6 +65,25 @@ def render_text(review: dict[str, Any]) -> str:
         "Memory refresh needed: "
         + ("yes" if review["memory_refresh_needed"] else "no")
     )
+    lines.append(
+        "Micro reasoning recommended: "
+        + ("yes" if review.get("micro_reasoning_recommended") else "no")
+    )
+    lines.append(
+        "Hotspot escalation recommended: "
+        + ("yes" if review.get("micro_reasoning_escalation_recommended") else "no")
+    )
+    if review.get("reasoning_hotspots"):
+        lines.append("Hotspots:")
+        lines.extend(f"- {item['summary']}" for item in review["reasoning_hotspots"])
+    if review.get("recurring_reasoning_hotspots"):
+        lines.append("Recurring hotspots:")
+        for item in review["recurring_reasoning_hotspots"]:
+            skills = ", ".join(item.get("recommended_skills", []))
+            if skills:
+                lines.append(f"- {item['summary']} Escalate with: {skills}.")
+            else:
+                lines.append(f"- {item['summary']}")
     if review["recommended_skills"]:
         lines.append("Recommended skills:")
         lines.extend(f"- {skill}" for skill in review["recommended_skills"])

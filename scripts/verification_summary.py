@@ -46,9 +46,14 @@ def build_verification_summary(base_dir: Path) -> dict[str, Any]:
     if latest_entry and str(latest_entry.get("verdict", "")).upper() == "FAIL":
         blockers.append("Latest verification verdict is FAIL.")
 
+    stream_coverage = verification.get("stream_coverage", [])
+    for stream_id in verification.get("uncovered_open_streams", []):
+        blockers.append(f"Task stream {stream_id} is missing current verification coverage.")
+
     return {
         "workspace_root": str(workspace_root),
         "task_loop_status": task_loop["status"],
+        "task_loop_mode": task_loop.get("mode", "legacy"),
         "status": verification["status"],
         "entry_count": verification["entry_count"],
         "invalid_lines": verification["invalid_lines"],
@@ -56,6 +61,7 @@ def build_verification_summary(base_dir: Path) -> dict[str, Any]:
         "latest_verdict": verification["latest_verdict"],
         "latest_checks_count": len(checks),
         "failing_checks": failing_checks,
+        "stream_coverage": stream_coverage,
         "covers_current_task_loop": verification["status"] == "present",
         "blockers": blockers,
     }
@@ -75,6 +81,12 @@ def render_text(summary: dict[str, Any]) -> str:
         lines.extend(
             f"- {check['name']}: {check.get('summary') or 'no summary'}"
             for check in summary["failing_checks"]
+        )
+    if summary.get("stream_coverage"):
+        lines.append("Stream coverage:")
+        lines.extend(
+            f"- {item['id']}: {'covered' if item['covered'] else 'missing'}"
+            for item in summary["stream_coverage"]
         )
     if summary["blockers"]:
         lines.append("Blockers:")
