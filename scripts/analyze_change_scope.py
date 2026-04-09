@@ -11,8 +11,11 @@ from typing import Any
 from workflow_state import (
     classify_risk,
     find_git_root,
+    get_memory_candidate_state,
     find_workspace_root,
     get_memory_status,
+    get_memory_sync_state,
+    get_shared_memory_status,
     get_task_loop_status,
     get_verification_state,
     is_workflow_state_path,
@@ -197,10 +200,16 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
     policy_info = load_policy(base_dir)
     policy = policy_info["data"]
     memory = get_memory_status(base_dir)
+    shared_memory = get_shared_memory_status(base_dir)
+    memory_candidates = get_memory_candidate_state(base_dir)
+    memory_sync = get_memory_sync_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy)
     verification = get_verification_state(base_dir, task_loop)
     needs_state_repair = (
         memory["status"] == "invalid"
+        or shared_memory["status"] == "invalid"
+        or memory_candidates["status"] == "invalid"
+        or memory_sync["status"] == "invalid"
         or policy_info["status"] == "invalid"
         or task_loop["status"] == "invalid"
         or verification["status"] == "invalid"
@@ -227,6 +236,10 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
             "risk_level": "low",
             "risk_reasons": ["No git repository detected."],
             "memory_status": memory["status"],
+            "shared_memory_status": shared_memory["status"],
+            "memory_candidates_status": memory_candidates["status"],
+            "memory_candidates_pending": memory_candidates["pending_count"],
+            "memory_sync_status": memory_sync["status"],
             "memory_refresh_needed": False,
             "policy_status": policy_info["status"],
             "task_loop_status": task_loop["status"],
@@ -271,7 +284,7 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         categories,
         risk_level,
         policy,
-    )
+    ) or memory_candidates["pending_count"] > 0
     verification_recommended = verification_required_for(risk_level, policy) or (
         total_changed_lines >= int(policy["verification"]["changed_lines_threshold"])
     )
@@ -299,6 +312,10 @@ def analyze_change_scope(base_dir: Path) -> dict[str, Any]:
         "risk_level": risk_level,
         "risk_reasons": risk["reasons"],
         "memory_status": memory["status"],
+        "shared_memory_status": shared_memory["status"],
+        "memory_candidates_status": memory_candidates["status"],
+        "memory_candidates_pending": memory_candidates["pending_count"],
+        "memory_sync_status": memory_sync["status"],
         "memory_refresh_needed": memory_refresh_needed,
         "policy_status": policy_info["status"],
         "task_loop_status": task_loop["status"],
@@ -373,9 +390,9 @@ def render_hook_message(result: dict[str, Any]) -> str:
 
     if result["memory_refresh_needed"]:
         reminders.append(
-            "[codex-coding-workflows] Durable project context likely changed. Run "
-            "project-memory-sync so `.codex-workflows/memory.md` keeps stable facts "
-            "and decisions current."
+            "[codex-coding-workflows] Durable project context likely changed or queued "
+            "memory candidates are pending. Run project-memory-sync auto-refresh so "
+            "local and shared workflow memory stay current."
         )
 
     if result["verification_recommended"]:

@@ -10,7 +10,8 @@ description: Generate a reviewer-facing summary from the current codex-coding-wo
 Use this skill to generate a reviewer-facing summary from `.codex-workflows/`.
 It should produce a concise artifact that explains what changed, what is
 verified, what is still blocking review, and what the next reviewer-facing
-actions are.
+actions are. If a team run exists, the summary should surface its latest status
+and any orchestration blockers too.
 
 Treat the output as a review artifact, not a feel-good recap. It should help a reviewer
 decide what to inspect next and what is still missing before review is credible.

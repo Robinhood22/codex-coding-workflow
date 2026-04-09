@@ -20,8 +20,22 @@ MEMORY_SECTIONS = (
     "Constraints",
     "Open Questions",
 )
+MEMORY_SCOPES = {"local", "shared"}
+SHARED_MEMORY_PREFIX = "[shared]"
 VERIFICATION_REQUIRED_KEYS = ("timestamp", "scope", "checks", "verdict")
 VALID_VERDICTS = {"PASS", "FAIL", "PARTIAL"}
+MEMORY_CANDIDATE_REQUIRED_KEYS = ("scope", "section", "text", "source")
+
+SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("anthropic-api-key", r"\bsk-ant-(?:api|admin)[a-zA-Z0-9_\-]{20,}\b"),
+    ("openai-api-key", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}\b"),
+    ("github-pat", r"\bgh[pousr]_[0-9A-Za-z]{20,}\b"),
+    ("github-fine-grained-pat", r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    ("aws-access-key", r"\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b"),
+    ("slack-token", r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
+    ("stripe-secret", r"\b(?:sk|rk)_(?:live|test|prod)_[A-Za-z0-9]{16,}\b"),
+    ("npm-token", r"\bnpm_[A-Za-z0-9]{20,}\b"),
+)
 
 DEFAULT_POLICY: dict[str, Any] = {
     "meta": {
@@ -43,6 +57,10 @@ DEFAULT_POLICY: dict[str, Any] = {
     },
     "memory": {
         "refresh_after_scope_change": True,
+        "auto_refresh_shared_memory": True,
+        "mirror_shared_into_local": True,
+        "shared_secret_scan": True,
+        "max_candidate_promotions": 50,
     },
 }
 
@@ -136,6 +154,9 @@ def get_state_paths(base_dir: Path) -> dict[str, Path]:
         "backups_dir": state_dir / BACKUPS_DIRNAME,
         "readme": state_dir / "README.md",
         "memory": state_dir / "memory.md",
+        "shared_memory": state_dir / "shared-memory.md",
+        "memory_candidates": state_dir / "memory-candidates.jsonl",
+        "memory_sync_log": state_dir / "memory-sync-log.jsonl",
         "task_loop": state_dir / "active-task-loop.md",
         "verification_log": state_dir / "verification-log.jsonl",
         "policy": state_dir / "policy.json",
@@ -151,8 +172,12 @@ def default_memory_sections() -> dict[str, list[str]]:
     }
 
 
-def render_memory_text(section_map: dict[str, list[str]]) -> str:
-    lines = ["# Project Memory", ""]
+def get_default_section_lines(section_name: str) -> list[str]:
+    return [line.strip() for line in default_memory_sections().get(section_name, [])]
+
+
+def render_memory_document(title: str, section_map: dict[str, list[str]]) -> str:
+    lines = [title, ""]
     defaults = default_memory_sections()
     for section in MEMORY_SECTIONS:
         lines.append(f"## {section}")
@@ -164,8 +189,16 @@ def render_memory_text(section_map: dict[str, list[str]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_memory_text(section_map: dict[str, list[str]]) -> str:
+    return render_memory_document("# Project Memory", section_map)
+
+
 def default_memory_text() -> str:
     return render_memory_text(default_memory_sections())
+
+
+def default_shared_memory_text() -> str:
+    return render_memory_document("# Shared Memory", default_memory_sections())
 
 
 def default_task_loop_text() -> str:
@@ -177,6 +210,9 @@ def default_readme_text() -> str:
         "# Codex Workflows State\n\n"
         "This directory stores repo-local workflow state for the "
         "`codex-coding-workflows` plugin.\n\n"
+        "Local memory lives in `memory.md`, shared memory lives in `shared-memory.md`, "
+        "pending automatic memory promotions live in `memory-candidates.jsonl`, and "
+        "sync history lives in `memory-sync-log.jsonl`.\n\n"
         "The `backups/` directory stores repair-time snapshots before malformed "
         "workflow files are rewritten.\n"
     )
@@ -195,6 +231,9 @@ def ensure_state_files(base_dir: Path) -> dict[str, Path]:
     defaults = {
         "readme": default_readme_text(),
         "memory": default_memory_text(),
+        "shared_memory": default_shared_memory_text(),
+        "memory_candidates": "",
+        "memory_sync_log": "",
         "task_loop": default_task_loop_text(),
         "verification_log": "",
         "policy": serialize_policy(DEFAULT_POLICY),
@@ -287,15 +326,29 @@ def normalize_memory_text(raw_text: str) -> str:
     return render_memory_text(cleaned)
 
 
-def get_memory_status(base_dir: Path) -> dict[str, Any]:
-    path = get_state_paths(base_dir)["memory"]
+def normalize_memory_document_text(raw_text: str, title: str) -> str:
+    if not raw_text.strip():
+        return render_memory_document(title, default_memory_sections())
+
+    parsed = parse_memory_sections(raw_text)
+    defaults = default_memory_sections()
+    cleaned: dict[str, list[str]] = {}
+
+    for section in MEMORY_SECTIONS:
+        lines = [line for line in parsed.get(section, []) if line.strip()]
+        cleaned[section] = lines or defaults[section]
+
+    return render_memory_document(title, cleaned)
+
+
+def get_memory_file_status(path: Path, display_name: str) -> dict[str, Any]:
     if not path.exists():
         return {
             "path": str(path),
             "exists": False,
             "status": "missing",
             "missing_sections": list(MEMORY_SECTIONS),
-            "reasons": ["memory.md is missing."],
+            "reasons": [f"{display_name} is missing."],
         }
 
     parsed = parse_memory_sections(path.read_text(encoding="utf-8"))
@@ -310,9 +363,20 @@ def get_memory_status(base_dir: Path) -> dict[str, Any]:
         "status": "healthy" if not missing_sections else "invalid",
         "missing_sections": missing_sections,
         "reasons": [] if not missing_sections else [
-            "memory.md is missing required sections or section content."
+            f"{display_name} is missing required sections or section content."
         ],
     }
+
+
+def get_memory_status(base_dir: Path) -> dict[str, Any]:
+    return get_memory_file_status(get_state_paths(base_dir)["memory"], "memory.md")
+
+
+def get_shared_memory_status(base_dir: Path) -> dict[str, Any]:
+    return get_memory_file_status(
+        get_state_paths(base_dir)["shared_memory"],
+        "shared-memory.md",
+    )
 
 
 def extract_updated_at(markdown_text: str) -> str | None:
@@ -604,52 +668,377 @@ def update_task_loop(base_dir: Path, raw_text: str) -> Path:
     return path
 
 
-def insert_bullet_in_section(markdown_text: str, section_name: str, bullet_text: str) -> str:
-    normalized = normalize_memory_text(markdown_text)
+def normalize_section_name(section_name: str | None) -> str:
+    if not section_name:
+        return "Stable Facts"
+    normalized = section_name.strip().lower()
+    for section in MEMORY_SECTIONS:
+        if section.lower() == normalized:
+            return section
+    raise SystemExit(
+        f"Unknown memory section {section_name!r}. Expected one of: {', '.join(MEMORY_SECTIONS)}"
+    )
+
+
+def insert_bullet_in_section(
+    markdown_text: str,
+    section_name: str,
+    bullet_text: str,
+    title: str = "# Project Memory",
+) -> str:
+    normalized = normalize_memory_document_text(markdown_text, title)
     bullet = bullet_text.strip()
     if not bullet.startswith("- "):
         bullet = f"- {bullet}"
     if bullet in normalized:
         return normalized
 
-    lines = normalized.splitlines()
-    output: list[str] = []
-    in_target = False
-    inserted = False
-    section_header = f"## {section_name}"
+    sections = parse_memory_sections(normalized)
+    defaults = set(get_default_section_lines(section_name))
+    existing_lines = [
+        line.strip()
+        for line in sections.get(section_name, [])
+        if line.strip() and line.strip() not in defaults
+    ]
+    if bullet in existing_lines:
+        return render_memory_document(title, sections)
 
-    for index, line in enumerate(lines):
-        if line.strip() == section_header:
-            in_target = True
-            output.append(line)
-            continue
-
-        if in_target and line.startswith("## "):
-            if not inserted:
-                if output and output[-1] != "":
-                    output.append("")
-                output.append(bullet)
-                inserted = True
-            in_target = False
-
-        output.append(line)
-
-        is_last = index == len(lines) - 1
-        if in_target and is_last and not inserted:
-            if output and output[-1] != "":
-                output.append("")
-            output.append(bullet)
-            inserted = True
-
-    return "\n".join(output).rstrip() + "\n"
+    sections[section_name] = existing_lines + [bullet]
+    return render_memory_document(title, sections)
 
 
 def append_memory_fact(base_dir: Path, fact: str) -> Path:
-    path = ensure_state_files(base_dir)["memory"]
+    return append_memory_entry(base_dir, fact, section="Stable Facts", scope="local")
+
+
+def scan_text_for_secrets(text: str) -> list[dict[str, str]]:
+    matches: list[dict[str, str]] = []
+    for rule_id, pattern in SECRET_PATTERNS:
+        if re.search(pattern, text):
+            matches.append({"rule_id": rule_id, "label": rule_id.replace("-", " ")})
+    return matches
+
+
+def append_memory_entry(
+    base_dir: Path,
+    text: str,
+    section: str = "Stable Facts",
+    scope: str = "local",
+) -> Path:
+    if scope not in MEMORY_SCOPES:
+        raise SystemExit(f"Unknown memory scope {scope!r}.")
+    normalized_section = normalize_section_name(section)
+    paths = ensure_state_files(base_dir)
+    path = paths["memory"] if scope == "local" else paths["shared_memory"]
+    if scope == "shared":
+        secret_matches = scan_text_for_secrets(text)
+        if secret_matches:
+            labels = ", ".join(match["label"] for match in secret_matches)
+            raise SystemExit(
+                f"Refusing to write shared memory because secret-like content was detected: {labels}"
+            )
+
     current = path.read_text(encoding="utf-8")
-    updated = insert_bullet_in_section(current, "Stable Facts", fact)
+    title = "# Project Memory" if scope == "local" else "# Shared Memory"
+    updated = insert_bullet_in_section(current, normalized_section, text, title=title)
     path.write_text(updated, encoding="utf-8")
     return path
+
+
+def append_shared_memory_fact(base_dir: Path, fact: str) -> Path:
+    return append_memory_entry(base_dir, fact, section="Stable Facts", scope="shared")
+
+
+def is_shared_mirror_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith(f"- {SHARED_MEMORY_PREFIX} ")
+
+
+def mirror_shared_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped.startswith("- "):
+        stripped = f"- {stripped}"
+    body = stripped[2:].strip()
+    if body.startswith(f"{SHARED_MEMORY_PREFIX} "):
+        return stripped
+    return f"- {SHARED_MEMORY_PREFIX} {body}"
+
+
+def mirror_shared_memory_into_local(base_dir: Path) -> dict[str, Any]:
+    paths = ensure_state_files(base_dir)
+    local_sections = parse_memory_sections(paths["memory"].read_text(encoding="utf-8"))
+    shared_sections = parse_memory_sections(paths["shared_memory"].read_text(encoding="utf-8"))
+
+    merged_sections: dict[str, list[str]] = {}
+    mirrored_count = 0
+    for section in MEMORY_SECTIONS:
+        base_lines = [
+            line
+            for line in local_sections.get(section, [])
+            if line.strip() and not is_shared_mirror_line(line)
+        ]
+        default_lines = set(get_default_section_lines(section))
+        shared_lines: list[str] = []
+        for line in shared_sections.get(section, []):
+            if not line.strip() or line.strip() in default_lines:
+                continue
+            mirrored_line = mirror_shared_line(line)
+            if mirrored_line not in shared_lines:
+                shared_lines.append(mirrored_line)
+        mirrored_count += len(shared_lines)
+        merged_sections[section] = base_lines + shared_lines
+
+    paths["memory"].write_text(render_memory_text(merged_sections), encoding="utf-8")
+    return {
+        "path": str(paths["memory"]),
+        "shared_source_path": str(paths["shared_memory"]),
+        "mirrored_count": mirrored_count,
+    }
+
+
+def validate_memory_candidate(entry: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for key in MEMORY_CANDIDATE_REQUIRED_KEYS:
+        if key not in entry:
+            reasons.append(f"Missing required key: {key}")
+    scope = str(entry.get("scope", ""))
+    if scope and scope not in MEMORY_SCOPES:
+        reasons.append(f"scope must be one of: {', '.join(sorted(MEMORY_SCOPES))}")
+    if "section" in entry:
+        try:
+            normalize_section_name(str(entry["section"]))
+        except SystemExit as exc:
+            reasons.append(str(exc))
+    if "text" in entry and not str(entry["text"]).strip():
+        reasons.append("text must be non-empty.")
+    if "source" in entry and not str(entry["source"]).strip():
+        reasons.append("source must be non-empty.")
+    timestamp = entry.get("timestamp")
+    if timestamp is not None and parse_timestamp(str(timestamp)) is None:
+        reasons.append("timestamp is not a valid ISO 8601 value.")
+    return reasons
+
+
+def load_memory_candidate_entries(base_dir: Path) -> dict[str, Any]:
+    path = get_state_paths(base_dir)["memory_candidates"]
+    if not path.exists():
+        return {
+            "path": str(path),
+            "entries": [],
+            "invalid_lines": 0,
+            "invalid_reasons": [],
+            "line_records": [],
+        }
+
+    entries: list[dict[str, Any]] = []
+    invalid_lines = 0
+    invalid_reasons: list[str] = []
+    line_records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: invalid JSON ({exc}).")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        if not isinstance(parsed, dict):
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: entry must decode to a JSON object.")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        reasons = validate_memory_candidate(parsed)
+        if reasons:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: {'; '.join(reasons)}")
+            line_records.append({"raw": line, "valid": False})
+            continue
+        candidate = dict(parsed)
+        candidate.setdefault("timestamp", now_timestamp())
+        entries.append(candidate)
+        line_records.append({"raw": line, "valid": True, "entry": candidate})
+
+    return {
+        "path": str(path),
+        "entries": entries,
+        "invalid_lines": invalid_lines,
+        "invalid_reasons": invalid_reasons,
+        "line_records": line_records,
+    }
+
+
+def append_memory_candidate(base_dir: Path, entry: dict[str, Any]) -> Path:
+    candidate = dict(entry)
+    candidate.setdefault("timestamp", now_timestamp())
+    reasons = validate_memory_candidate(candidate)
+    if reasons:
+        raise SystemExit("Invalid memory candidate:\n- " + "\n- ".join(reasons))
+    if str(candidate.get("scope")) == "shared":
+        secret_matches = scan_text_for_secrets(str(candidate.get("text", "")))
+        if secret_matches:
+            labels = ", ".join(match["label"] for match in secret_matches)
+            raise SystemExit(
+                "Refusing to queue shared memory candidate because secret-like content was "
+                f"detected: {labels}"
+            )
+    path = ensure_state_files(base_dir)["memory_candidates"]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(candidate, sort_keys=True) + "\n")
+    return path
+
+
+def load_memory_sync_entries(base_dir: Path) -> dict[str, Any]:
+    path = get_state_paths(base_dir)["memory_sync_log"]
+    if not path.exists():
+        return {
+            "path": str(path),
+            "entries": [],
+            "invalid_lines": 0,
+            "invalid_reasons": [],
+        }
+
+    entries: list[dict[str, Any]] = []
+    invalid_lines = 0
+    invalid_reasons: list[str] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: invalid JSON ({exc}).")
+            continue
+        if not isinstance(parsed, dict):
+            invalid_lines += 1
+            invalid_reasons.append(f"Line {line_number}: entry must decode to a JSON object.")
+            continue
+        entries.append(parsed)
+    return {
+        "path": str(path),
+        "entries": entries,
+        "invalid_lines": invalid_lines,
+        "invalid_reasons": invalid_reasons,
+    }
+
+
+def append_memory_sync_entry(base_dir: Path, entry: dict[str, Any]) -> Path:
+    payload = dict(entry)
+    payload.setdefault("timestamp", now_timestamp())
+    path = ensure_state_files(base_dir)["memory_sync_log"]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    return path
+
+
+def promote_memory_candidates(base_dir: Path) -> dict[str, Any]:
+    paths = ensure_state_files(base_dir)
+    policy = load_policy(base_dir)["data"]
+    loaded = load_memory_candidate_entries(base_dir)
+    max_items = int(policy["memory"].get("max_candidate_promotions", 50))
+    shared_secret_scan = bool(policy["memory"].get("shared_secret_scan", True))
+
+    promoted_local = 0
+    promoted_shared = 0
+    blocked_shared: list[dict[str, Any]] = []
+    processed = 0
+    retained_lines: list[str] = []
+
+    for record in loaded["line_records"]:
+        if not record.get("valid"):
+            retained_lines.append(str(record["raw"]))
+            continue
+        entry = dict(record["entry"])
+        if processed >= max_items:
+            retained_lines.append(str(record["raw"]))
+            continue
+
+        scope = str(entry["scope"])
+        section = normalize_section_name(str(entry["section"]))
+        text = str(entry["text"]).strip()
+        if scope == "shared" and shared_secret_scan:
+            secret_matches = scan_text_for_secrets(text)
+            if secret_matches:
+                blocked_shared.append(
+                    {
+                        "section": section,
+                        "source": str(entry["source"]),
+                        "text_redacted": True,
+                        "secret_matches": secret_matches,
+                    }
+                )
+                processed += 1
+                continue
+
+        append_memory_entry(base_dir, text, section=section, scope=scope)
+        if scope == "local":
+            promoted_local += 1
+        else:
+            promoted_shared += 1
+        processed += 1
+
+    paths["memory_candidates"].write_text(
+        ("\n".join(retained_lines) + "\n") if retained_lines else "",
+        encoding="utf-8",
+    )
+
+    mirrored = {"mirrored_count": 0, "path": str(paths["memory"])}
+    if policy["memory"].get("auto_refresh_shared_memory", False) and policy["memory"].get(
+        "mirror_shared_into_local", False
+    ):
+        mirrored = mirror_shared_memory_into_local(base_dir)
+
+    summary = {
+        "promoted_local": promoted_local,
+        "promoted_shared": promoted_shared,
+        "blocked_shared": blocked_shared,
+        "retained_candidates": len(
+            [line for line in retained_lines if line.strip().startswith("{")]
+        ),
+        "invalid_candidate_lines": loaded["invalid_lines"],
+        "mirrored_shared_count": mirrored["mirrored_count"],
+    }
+    append_memory_sync_entry(
+        base_dir,
+        {
+            "action": "auto_refresh",
+            "summary": summary,
+        },
+    )
+    return summary
+
+
+def get_memory_candidate_state(base_dir: Path) -> dict[str, Any]:
+    loaded = load_memory_candidate_entries(base_dir)
+    if loaded["invalid_lines"] > 0:
+        status = "invalid"
+    elif loaded["entries"]:
+        status = "pending"
+    else:
+        status = "healthy"
+    return {
+        "path": loaded["path"],
+        "pending_count": len(loaded["entries"]),
+        "invalid_lines": loaded["invalid_lines"],
+        "invalid_reasons": loaded["invalid_reasons"],
+        "status": status,
+    }
+
+
+def get_memory_sync_state(base_dir: Path) -> dict[str, Any]:
+    loaded = load_memory_sync_entries(base_dir)
+    latest = loaded["entries"][-1] if loaded["entries"] else None
+    return {
+        "path": loaded["path"],
+        "entry_count": len(loaded["entries"]),
+        "invalid_lines": loaded["invalid_lines"],
+        "invalid_reasons": loaded["invalid_reasons"],
+        "latest_timestamp": (latest or {}).get("timestamp"),
+        "latest_action": (latest or {}).get("action"),
+        "status": "invalid" if loaded["invalid_lines"] > 0 else "healthy",
+    }
 
 
 def append_verification_entry(base_dir: Path, entry: dict[str, Any]) -> Path:
@@ -675,6 +1064,9 @@ def backup_state_file(base_dir: Path, target: Path) -> str | None:
 def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
     policy_info = load_policy(base_dir)
     memory = get_memory_status(base_dir)
+    shared_memory = get_shared_memory_status(base_dir)
+    memory_candidates = get_memory_candidate_state(base_dir)
+    memory_sync = get_memory_sync_state(base_dir)
     task_loop = get_task_loop_status(base_dir, policy_info["data"])
     verification = get_verification_state(base_dir, task_loop)
     paths = get_state_paths(base_dir)
@@ -682,6 +1074,9 @@ def inspect_workflow_state(base_dir: Path) -> dict[str, Any]:
         "workspace_root": str(find_workspace_root(base_dir)),
         "state_dir": str(paths["state_dir"]),
         "memory": memory,
+        "shared_memory": shared_memory,
+        "memory_candidates": memory_candidates,
+        "memory_sync": memory_sync,
         "policy": policy_info,
         "task_loop": task_loop,
         "verification": verification,

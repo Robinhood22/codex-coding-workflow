@@ -8,6 +8,7 @@ from typing import Any
 
 from analyze_change_scope import analyze_change_scope
 from branch_readiness import summarize_branch
+from team_state import list_runs
 from verification_summary import build_verification_summary
 from workflow_state import (
     ensure_state_files,
@@ -15,6 +16,7 @@ from workflow_state import (
     find_workspace_root,
     get_state_paths,
     inspect_workflow_state,
+    parse_timestamp,
     parse_memory_sections,
 )
 
@@ -53,20 +55,70 @@ def flatten_blockers(items: list[str]) -> list[str]:
     return [item for item in items if item]
 
 
+def summarize_latest_team_run(base_dir: Path) -> dict[str, Any] | None:
+    runs = list_runs(base_dir)
+    if not runs:
+        return None
+
+    def sort_key(run: dict[str, Any]) -> str:
+        updated_at = parse_timestamp(str(run.get("updated_at") or ""))
+        return updated_at.isoformat() if updated_at is not None else ""
+
+    latest = sorted(runs, key=sort_key, reverse=True)[0]
+    blockers: list[str] = []
+    if latest.get("validation_errors"):
+        blockers.append("Team run state has validation errors.")
+    if latest.get("missing_assignments"):
+        blockers.append("One or more worker assignments are missing.")
+    if latest.get("missing_outputs"):
+        blockers.append("Completed workers are missing output artifacts.")
+    worker_statuses = latest.get("worker_statuses", {})
+    if any(status == "pending" for status in worker_statuses.values()):
+        blockers.append("One or more workers are still pending.")
+    if any(status == "running" for status in worker_statuses.values()):
+        blockers.append("One or more workers are still running.")
+    if latest.get("status") in {"failed", "cancelled", "partial"}:
+        blockers.append(f"Run status is {latest.get('status')}.")
+
+    return {
+        "run_id": latest["run_id"],
+        "status": latest.get("status"),
+        "updated_at": latest.get("updated_at"),
+        "workflow": latest.get("workflow"),
+        "worker_count": latest.get("worker_count", 0),
+        "worker_counts": latest.get("worker_counts", {}),
+        "agent_assigned_workers": latest.get("agent_assigned_workers", []),
+        "missing_assignments": latest.get("missing_assignments", []),
+        "blockers": blockers,
+    }
+
+
 def build_next_actions(
     change_scope: dict[str, Any],
     verification_summary: dict[str, Any],
     branch_summary: dict[str, Any] | None,
+    latest_team_run: dict[str, Any] | None,
+    state: dict[str, Any],
 ) -> list[str]:
     actions: list[str] = []
     if change_scope.get("state_repair_needed"):
         actions.append("Run workflow-state-repair before relying on repo-local workflow state.")
+    if state.get("shared_memory", {}).get("status") == "invalid":
+        actions.append("Repair shared memory before relying on shared durable context.")
+    if state.get("memory_candidates", {}).get("pending_count", 0) > 0:
+        actions.append("Run project-memory-sync auto-refresh to promote queued memory candidates.")
+    if state.get("memory_sync", {}).get("status") == "invalid":
+        actions.append("Repair the memory sync log before trusting automatic/shared memory state.")
     if change_scope.get("task_loop_status") in {"missing", "stale", "invalid"}:
         actions.append("Refresh the active task loop so it matches the current implementation.")
     if verification_summary.get("status") in {"missing", "stale", "invalid"}:
         actions.append("Run verify-change or refresh verification evidence before review or handoff.")
     if branch_summary and branch_summary.get("upstream") is None:
         actions.append("Set an upstream branch before treating this as ready to land.")
+    if latest_team_run and latest_team_run.get("blockers"):
+        actions.append(
+            f"Resolve blockers in team run `{latest_team_run['run_id']}` before treating the orchestration state as complete."
+        )
     if not actions:
         actions.append("No immediate workflow blockers detected from plugin state alone.")
     return actions
@@ -78,7 +130,14 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
     change_scope = analyze_change_scope(base_dir)
     verification = build_verification_summary(base_dir)
     branch_summary = summarize_branch_state(base_dir)
-    next_actions = build_next_actions(change_scope, verification, branch_summary)
+    latest_team_run = summarize_latest_team_run(base_dir)
+    next_actions = build_next_actions(
+        change_scope,
+        verification,
+        branch_summary,
+        latest_team_run,
+        state,
+    )
 
     lines = [
         "# Review-Ready Summary",
@@ -90,6 +149,8 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         f"- Task loop: {state['task_loop']['status']}",
         f"- Verification: {verification['status']}",
         f"- Memory: {state['memory']['status']}",
+        f"- Shared memory: {state['shared_memory']['status']}",
+        f"- Memory candidates: {state['memory_candidates']['pending_count']}",
         f"- Policy: {state['policy']['status']}",
         "",
         "## Change Scope",
@@ -116,6 +177,21 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         lines.append("- Verification blockers:")
         lines.extend([f"  - {item}" for item in verification["blockers"]])
 
+    lines.extend(["", "## Latest Team Run"])
+    if latest_team_run:
+        lines.append(f"- Run id: `{latest_team_run['run_id']}`")
+        lines.append(f"- Workflow: `{latest_team_run.get('workflow') or 'unknown'}`")
+        lines.append(f"- Status: {latest_team_run.get('status') or 'unknown'}")
+        lines.append(f"- Updated: {latest_team_run.get('updated_at') or 'unknown'}")
+        lines.append(
+            f"- Workers with live agent ids: {len(latest_team_run.get('agent_assigned_workers', []))}"
+        )
+        if latest_team_run.get("blockers"):
+            lines.append("- Team run blockers:")
+            lines.extend([f"  - {item}" for item in latest_team_run["blockers"]])
+    else:
+        lines.append("- No team runs recorded.")
+
     lines.extend(["", "## Blockers"])
     blockers = branch_summary["blockers"] if branch_summary else ["No git repository detected."]
     lines.extend([f"- {blocker}" for blocker in blockers])
@@ -132,6 +208,7 @@ def build_review_ready_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         "change_scope": change_scope,
         "verification": verification,
         "branch_summary": branch_summary,
+        "latest_team_run": latest_team_run,
         "next_actions": next_actions,
     }
     return report, metadata
@@ -144,7 +221,14 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
     verification = build_verification_summary(base_dir)
     branch_summary = summarize_branch_state(base_dir)
     memory_sections = read_memory_sections(base_dir)
-    next_actions = build_next_actions(change_scope, verification, branch_summary)
+    latest_team_run = summarize_latest_team_run(base_dir)
+    next_actions = build_next_actions(
+        change_scope,
+        verification,
+        branch_summary,
+        latest_team_run,
+        state,
+    )
 
     stable_facts = memory_sections.get("Stable Facts", [])
     constraints = memory_sections.get("Constraints", [])
@@ -170,16 +254,32 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
             f"- Verification state: {verification['status']}",
             f"- Latest verdict: {verification.get('latest_verdict') or 'none'}",
             f"- Latest timestamp: {verification.get('latest_timestamp') or 'none'}",
+            f"- Shared memory: {state['shared_memory']['status']}",
+            f"- Memory candidates: {state['memory_candidates']['pending_count']}",
         ]
     )
     if verification.get("blockers"):
         lines.append("- Verification blockers:")
         lines.extend([f"  - {item}" for item in verification["blockers"]])
 
+    lines.extend(["", "## Latest Team Run"])
+    if latest_team_run:
+        lines.append(f"- Run id: `{latest_team_run['run_id']}`")
+        lines.append(f"- Status: {latest_team_run.get('status') or 'unknown'}")
+        lines.append(
+            f"- Workers with live agent ids: {len(latest_team_run.get('agent_assigned_workers', []))}"
+        )
+        if latest_team_run.get("blockers"):
+            lines.append("- Team run blockers:")
+            lines.extend([f"  - {item}" for item in latest_team_run["blockers"]])
+    else:
+        lines.append("- No team runs recorded.")
+
     lines.extend(["", "## What Is Still Open"])
     open_items = flatten_blockers(
         (branch_summary["blockers"] if branch_summary else [])
         + state["task_loop"].get("reasons", [])
+        + (latest_team_run["blockers"] if latest_team_run else [])
     )
     if open_items:
         lines.extend([f"- {item}" for item in open_items])
@@ -208,6 +308,7 @@ def build_handoff_report(base_dir: Path) -> tuple[str, dict[str, Any]]:
         "verification": verification,
         "branch_summary": branch_summary,
         "memory_sections": memory_sections,
+        "latest_team_run": latest_team_run,
         "next_actions": next_actions,
     }
     return report, metadata

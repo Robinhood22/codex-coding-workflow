@@ -7,11 +7,22 @@ description: Maintain repo-local workflow memory and task state for the codex-co
 
 ## Overview
 
-Use this skill to keep repo-local workflow state current without pretending Codex has
-automatic memory. This skill owns `.codex-workflows/`.
+Use this skill to keep repo-local workflow state current without pretending Codex core has
+runtime-owned automatic memory. This skill owns `.codex-workflows/`.
 
 Record only information that will still matter later: durable facts, stable constraints,
 meaningful preferences, and decisions that should survive the current turn.
+
+When team orchestration is in play, treat `.codex-workflows/teams/` as part of the same
+inspectable state surface. Use it to understand the latest durable team run before
+planning handoffs or claiming work is complete.
+
+This skill now also owns plugin-managed shared memory:
+
+- `memory.md`: local durable memory used for current-workspace recall
+- `shared-memory.md`: repo-shared durable memory for teammates
+- `memory-candidates.jsonl`: queued durable facts awaiting promotion
+- `memory-sync-log.jsonl`: automatic/shared-memory sync history
 
 ## Workflow
 
@@ -25,18 +36,36 @@ py -3 "./plugins/codex-coding-workflows/scripts/memory_sync.py" --init --show
 2. Record only durable facts.
    - Add stable project constraints, preferences, or decisions that will still matter later.
    - Do not store temporary debugging notes, speculation, raw logs, or provisional guesses.
-3. Refresh the task loop when the work changed shape.
+   - Use local scope for personal or workspace-local durable context.
+   - Use shared scope only for teammate-safe durable context.
+   - Direct shared writes should mirror into local recall and leave a sync-log entry.
+3. Queue facts when you are not ready to write them directly.
+   - Add a candidate:
+
+```text
+python3 "./scripts/memory_sync.py" --append-memory-candidate "<fact>" --scope <local|shared> --section "Stable Facts" --candidate-source "<source>" --show
+```
+
+4. Refresh automatic/shared memory.
+   - Promote queued candidates and mirror shared memory into local recall:
+
+```text
+python3 "./scripts/memory_sync.py" --auto-refresh --show
+```
+
+5. Refresh the task loop when the work changed shape.
    - Rewrite `active-task-loop.md` so it has exactly one active step.
    - Prefer replacing stale task loops over appending more clutter.
-4. Inspect state before relying on it.
-   - Use `--show` or `--json` to confirm whether the task loop or verification state is stale.
-5. Repair invalid state before trusting it.
-   - If `memory.md`, `policy.json`, `active-task-loop.md`, or `verification-log.jsonl`
-     is malformed, route to `workflow-state-repair`.
+6. Inspect state before relying on it.
+   - Use `--show` or `--json` to confirm whether task, verification, shared memory, or candidate state is stale or invalid.
+7. Repair invalid state before trusting it.
+   - If `memory.md`, `shared-memory.md`, `memory-candidates.jsonl`, `memory-sync-log.jsonl`,
+     `policy.json`, `active-task-loop.md`, or `verification-log.jsonl` is malformed, route to `workflow-state-repair`.
 
 ## Guardrails
 
 - Treat `.codex-workflows/` as inspectable working state, not hidden automation.
 - Do not write memory from hook reminders alone.
 - Do not record secrets, tokens, or environment-specific credentials.
+- Shared memory must pass secret scanning before it is queued or written.
 - Do not confuse "this was mentioned once" with "this belongs in durable memory."

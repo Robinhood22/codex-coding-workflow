@@ -96,6 +96,10 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     verification_state = verification_summary["status"]
     risk_level = change_scope.get("risk_level", "low")
     memory_status = change_scope.get("memory_status", "missing")
+    shared_memory_status = change_scope.get("shared_memory_status", "missing")
+    memory_candidates_status = change_scope.get("memory_candidates_status", "healthy")
+    memory_candidates_pending = int(change_scope.get("memory_candidates_pending", 0) or 0)
+    memory_sync_status = change_scope.get("memory_sync_status", "healthy")
     policy_status = change_scope.get("policy_status", "missing")
 
     blockers: list[str] = []
@@ -123,6 +127,16 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         blockers.append("Workflow policy is invalid and should be repaired before shipping.")
     if memory_status == "invalid":
         blockers.append("Workflow memory is invalid and should be repaired before shipping.")
+    if shared_memory_status == "invalid":
+        blockers.append("Shared workflow memory is invalid and should be repaired before shipping.")
+    if memory_candidates_status == "invalid":
+        blockers.append("Queued memory candidates are invalid and should be repaired before shipping.")
+    if memory_sync_status == "invalid":
+        blockers.append("Memory sync log is invalid and should be repaired before shipping.")
+    if memory_candidates_pending > 0:
+        blockers.append(
+            f"{memory_candidates_pending} queued memory candidate(s) still need auto-refresh promotion."
+        )
 
     recent_log = run_git(["log", "--oneline", "-n", "5"], repo_root).stdout.strip().splitlines()
 
@@ -142,6 +156,10 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         "workflow_state": workflow_state,
         "verification_state": verification_state,
         "memory_state": memory_status,
+        "shared_memory_state": shared_memory_status,
+        "memory_candidates_state": memory_candidates_status,
+        "memory_candidates_pending": memory_candidates_pending,
+        "memory_sync_state": memory_sync_status,
         "policy_state": policy_status,
         "verification_summary": verification_summary,
         "change_scope": change_scope,
@@ -166,6 +184,11 @@ def render_text(summary: dict[str, Any]) -> str:
         f"Workflow state: {summary.get('workflow_state', 'unknown')}",
         f"Verification state: {summary.get('verification_state', 'unknown')}",
         f"Memory state: {summary.get('memory_state', 'unknown')}",
+        f"Shared memory state: {summary.get('shared_memory_state', 'unknown')}",
+        "Memory candidates: "
+        f"{summary.get('memory_candidates_pending', 0)} "
+        f"({summary.get('memory_candidates_state', 'unknown')})",
+        f"Memory sync state: {summary.get('memory_sync_state', 'unknown')}",
         f"Policy state: {summary.get('policy_state', 'unknown')}",
         f"Risk level: {summary.get('risk_level', 'unknown')}",
     ]
@@ -212,6 +235,10 @@ def main() -> int:
             "workflow_state": "unknown",
             "verification_state": "unknown",
             "memory_state": "unknown",
+            "shared_memory_state": "unknown",
+            "memory_candidates_state": "unknown",
+            "memory_candidates_pending": 0,
+            "memory_sync_state": "unknown",
             "policy_state": "unknown",
             "verification_summary": {},
             "change_scope": {},
