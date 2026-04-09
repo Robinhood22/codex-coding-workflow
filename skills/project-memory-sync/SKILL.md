@@ -23,6 +23,17 @@ This skill now also owns plugin-managed shared memory:
 - `shared-memory.md`: repo-shared durable memory for teammates
 - `memory-candidates.jsonl`: queued durable facts awaiting promotion
 - `memory-sync-log.jsonl`: automatic/shared-memory sync history
+- `buglog.jsonl`: explicit repo-local bug-fix recall
+- `project-map.md`: optional focused repo map generated on demand
+
+Local and shared memory should preserve these durable sections when they matter:
+
+- `Stable Facts`
+- `Preferences`
+- `Constraints`
+- `Open Questions`
+- `Do-Not-Repeat`
+- `Decision Log`
 
 ## Workflow
 
@@ -35,6 +46,7 @@ py -3 "./plugins/codex-coding-workflows/scripts/memory_sync.py" --init --show
 
 2. Record only durable facts.
    - Add stable project constraints, preferences, or decisions that will still matter later.
+   - Use `Do-Not-Repeat` for repeated failure modes and `Decision Log` for durable implementation choices.
    - Do not store temporary debugging notes, speculation, raw logs, or provisional guesses.
    - Use local scope for personal or workspace-local durable context.
    - Use shared scope only for teammate-safe durable context.
@@ -60,7 +72,14 @@ python3 "./scripts/memory_sync.py" --auto-refresh --show
    - Use `--show` or `--json` to confirm whether task, verification, shared memory, or candidate state is stale or invalid.
 7. Repair invalid state before trusting it.
    - If `memory.md`, `shared-memory.md`, `memory-candidates.jsonl`, `memory-sync-log.jsonl`,
-     `policy.json`, `active-task-loop.md`, or `verification-log.jsonl` is malformed, route to `workflow-state-repair`.
+     `buglog.jsonl`, `policy.json`, `active-task-loop.md`, or `verification-log.jsonl` is malformed,
+     route to `workflow-state-repair`.
+8. Generate a focused repo map when the codebase is unfamiliar or has shifted materially.
+   - Run:
+
+```text
+python3 "./scripts/project_map.py" --generate
+```
 
 ## Guardrails
 

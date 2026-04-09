@@ -41,6 +41,7 @@ def render_text(summary: dict[str, Any]) -> str:
         f"Shared memory: {summary['shared_memory']['status']}",
         f"Memory candidates: {summary['memory_candidates']['status']} ({summary['memory_candidates']['pending_count']} pending)",
         f"Memory sync: {summary['memory_sync']['status']}",
+        f"Bug log: {summary['buglog']['status']} ({summary['buglog']['entry_count']} entries)",
         f"Policy: {summary['policy']['status']}",
         f"Task loop: {summary['task_loop']['status']}",
         f"Verification: {summary['verification']['status']}",
@@ -98,6 +99,12 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     parser.add_argument("--append-memory", type=str, default=None, help="Append a durable memory entry.")
     parser.add_argument(
+        "--append-memory-section",
+        type=str,
+        default=None,
+        help="Section to target when using --append-memory.",
+    )
+    parser.add_argument(
         "--append-memory-candidate",
         type=str,
         default=None,
@@ -152,7 +159,7 @@ def main() -> int:
         append_memory_entry(
             base_dir,
             args.append_memory,
-            section=args.section,
+            section=args.append_memory_section or args.section,
             scope=args.scope,
         )
         if args.scope == "shared":
@@ -165,7 +172,7 @@ def main() -> int:
                 {
                     "action": "manual_shared_append",
                     "summary": {
-                        "section": args.section,
+                        "section": args.append_memory_section or args.section,
                         "mirrored_shared_count": mirrored["mirrored_count"],
                     },
                 },
@@ -229,7 +236,7 @@ def main() -> int:
         print(
             "No operation requested. Use --show, --init, --append-memory, "
             "--append-memory-candidate, --auto-refresh, --set-task-loop, "
-            "or --append-verification-json."
+            "--append-verification-json, or --append-memory-section."
         )
     return 0
 

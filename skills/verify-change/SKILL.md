@@ -48,7 +48,7 @@ py -3 "./plugins/codex-coding-workflows/scripts/policy_check.py" --intent verify
    - CLI or scripts: execute representative commands, error paths, and boundary inputs
    - config or infra: run validation or dry-run style checks
    - refactors: prove behavior did not change through existing tests and observable spot checks
-   - bug fixes: reproduce the old failure, verify the fix, then probe nearby regressions
+   - bug fixes: search repo-local bug memory before repeating known work, reproduce the old failure, verify the fix, then probe nearby regressions
 5. Reuse existing Codex capabilities where they help.
    - use review or QA workflows when they are the best verification surface
    - do not duplicate an existing built-in skill just for style points
@@ -60,10 +60,32 @@ py -3 "./plugins/codex-coding-workflows/scripts/policy_check.py" --intent verify
    - concurrency or duplicate-submission behavior when applicable
 7. Persist the evidence.
    - Append a verification entry to `.codex-workflows/verification-log.jsonl` through `memory_sync.py` using `--append-verification-json` or `--append-verification-file`.
+   - For confirmed bug fixes, append a `.codex-workflows/buglog.jsonl` entry through `buglog.py` only after at least one meaningful check passed or the user explicitly confirmed the fix.
 8. If verification state is invalid, repair the log before trusting it.
    - Use `workflow-state-repair` when malformed verification entries block a credible verdict.
 9. Generate a reviewer-facing artifact when needed.
    - If the user wants a clean recap after verification, route to `review-ready-summary`.
+
+## Bug Memory Workflow
+
+For bug-fix verification, use bug memory deliberately instead of treating it like magic automation.
+
+1. Search before you repeat yourself.
+   - Run:
+
+```text
+python3 "./scripts/buglog.py" --search "<symptom or keyword>" --path "<file-or-subtree>"
+```
+
+2. Add a new entry only after the fix is credibly confirmed.
+   - Use:
+
+```text
+python3 "./scripts/buglog.py" --append-json '{"file":"src/example.py","symptom":"...","root_cause":"...","fix":"...","tags":["bugfix"],"source":"verify-change"}'
+```
+
+3. If bug memory is malformed, repair it before you trust search results.
+   - Route to `workflow-state-repair`.
 
 ## Required Check Format
 
