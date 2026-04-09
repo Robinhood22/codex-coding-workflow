@@ -11,6 +11,9 @@ Use this skill to generate a teammate-facing handoff artifact from
 `.codex-workflows/`. The result should explain what changed, what is verified,
 what remains open, and what the next person should do.
 
+If a recent team run exists, include its status and unresolved orchestration blockers so
+the next person does not have to rediscover them.
+
 Treat the output as an operational handoff, not a narrative recap. The next person
 should be able to pick up the work without rereading the whole thread.
 

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Add agentic code review, planning, task-loop discipline, adversarial verification, review-ready summaries, handoff summaries, and ship-readiness workflows to Codex.",
   "author": {
-    "name": "Robinhood22",
+    "name": "OpenAI",
     "email": "support@openai.com",
     "url": "https://openai.com/"
   },
@@ -25,7 +25,7 @@
     "displayName": "Coding Workflows",
     "shortDescription": "Review, plan, track, verify, and audit coding work",
     "longDescription": "Use Codex Coding Workflows to add agentic code review, explicit planning, task-loop discipline, adversarial verification, review-ready and handoff summary artifacts, and ship-readiness audit skills to local coding sessions without claiming runtime features Codex core does not expose today.",
-    "developerName": "Robinhood22",
+    "developerName": "OpenAI",
     "category": "Coding",
     "capabilities": [
       "Interactive",

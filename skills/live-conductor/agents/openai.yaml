@@ -1,0 +1,6 @@
+interface:
+  display_name: "Live Conductor"
+  short_description: "Run prepared team workflows through live subagents"
+  icon_small: "../../assets/coding-workflows-small.svg"
+  icon_large: "../../assets/coding-workflows.svg"
+  default_prompt: "Use $live-conductor when a `.codex-workflows/teams/<run-id>/` run already exists and this environment can actually spawn subagents, so the conductor should execute the live worker loop instead of degrading to serial work."

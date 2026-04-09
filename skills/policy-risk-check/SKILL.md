@@ -41,7 +41,7 @@ py -3 "./plugins/codex-coding-workflows/scripts/policy_check.py" --json
 3. Recommend the next workflow step.
    - `verify-change` for medium/high-risk work
    - `ship-readiness-audit` when the user is asking about landing or release readiness
-   - `execution-task-loop` when the task loop or task streams are stale or missing
+   - `execution-task-loop` when the task loop is stale or missing
    - `project-memory-sync` when durable context changed
    - `workflow-state-repair` when policy or repo-local workflow state is invalid
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Agentic Code Review"
   short_description: "Review diffs and PRs for semantic regressions"
-  default_prompt: "Use $agentic-code-review to review this diff or PR with semi-formal reasoning, surface semantic risks, and use swarm mode only when the change justifies it."
+  default_prompt: "Use $agentic-code-review to review this diff or PR with semi-formal reasoning, surface semantic risks, route swarm planning through $team-orchestration, and hand live worker dispatch to $live-conductor when the run is actually being executed."

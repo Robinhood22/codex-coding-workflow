@@ -20,8 +20,6 @@ def run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
-
-
 def parse_status(status_output: str) -> dict[str, Any]:
     changed_files: list[str] = []
     staged = 0
@@ -86,7 +84,6 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     verification_summary = build_verification_summary(repo_root)
 
     task_loop_status = change_scope.get("task_loop_status", "missing")
-    task_state_mode = change_scope.get("task_state_mode", "legacy")
     if task_loop_status == "healthy":
         workflow_state = "healthy"
     elif task_loop_status == "stale":
@@ -99,6 +96,10 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     verification_state = verification_summary["status"]
     risk_level = change_scope.get("risk_level", "low")
     memory_status = change_scope.get("memory_status", "missing")
+    shared_memory_status = change_scope.get("shared_memory_status", "missing")
+    memory_candidates_status = change_scope.get("memory_candidates_status", "healthy")
+    memory_candidates_pending = int(change_scope.get("memory_candidates_pending", 0) or 0)
+    memory_sync_status = change_scope.get("memory_sync_status", "healthy")
     policy_status = change_scope.get("policy_status", "missing")
 
     blockers: list[str] = []
@@ -111,11 +112,11 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
     if ahead == 0 and not status["changed_files"]:
         blockers.append("No local changes or commits are ahead of upstream.")
     if workflow_state == "missing_task_loop" and change_scope.get("changed_file_count", 0) > 0:
-        blockers.append("Workflow task loop or task streams are missing for active work.")
+        blockers.append("Workflow task loop is missing for active work.")
     if workflow_state == "invalid_task_loop":
-        blockers.append("Workflow task loop or task streams are invalid.")
+        blockers.append("Workflow task loop is invalid.")
     if workflow_state == "stale_task_loop":
-        blockers.append("Workflow task loop or task streams are stale or invalid.")
+        blockers.append("Workflow task loop is stale or invalid.")
     if verification_state == "missing" and risk_level in {"medium", "high"}:
         blockers.append("No verification evidence is logged for a medium/high-risk change.")
     if verification_state == "stale":
@@ -126,6 +127,16 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         blockers.append("Workflow policy is invalid and should be repaired before shipping.")
     if memory_status == "invalid":
         blockers.append("Workflow memory is invalid and should be repaired before shipping.")
+    if shared_memory_status == "invalid":
+        blockers.append("Shared workflow memory is invalid and should be repaired before shipping.")
+    if memory_candidates_status == "invalid":
+        blockers.append("Queued memory candidates are invalid and should be repaired before shipping.")
+    if memory_sync_status == "invalid":
+        blockers.append("Memory sync log is invalid and should be repaired before shipping.")
+    if memory_candidates_pending > 0:
+        blockers.append(
+            f"{memory_candidates_pending} queued memory candidate(s) still need auto-refresh promotion."
+        )
 
     recent_log = run_git(["log", "--oneline", "-n", "5"], repo_root).stdout.strip().splitlines()
 
@@ -143,12 +154,12 @@ def summarize_branch(repo_root: Path) -> dict[str, Any]:
         "recent_commits": recent_log,
         "risk_level": risk_level,
         "workflow_state": workflow_state,
-        "task_state_mode": task_state_mode,
-        "task_stream_count": change_scope.get("task_stream_count", 0),
-        "open_task_stream_count": change_scope.get("open_task_stream_count", 0),
-        "primary_stream_id": change_scope.get("primary_stream_id"),
         "verification_state": verification_state,
         "memory_state": memory_status,
+        "shared_memory_state": shared_memory_status,
+        "memory_candidates_state": memory_candidates_status,
+        "memory_candidates_pending": memory_candidates_pending,
+        "memory_sync_state": memory_sync_status,
         "policy_state": policy_status,
         "verification_summary": verification_summary,
         "change_scope": change_scope,
@@ -170,20 +181,17 @@ def render_text(summary: dict[str, Any]) -> str:
         f"{summary['staged_count']} staged, "
         f"{summary['unstaged_count']} unstaged, "
         f"{summary['untracked_count']} untracked",
-        "Workflow state: "
-        f"{summary.get('workflow_state', 'unknown')} ({summary.get('task_state_mode', 'legacy')})",
+        f"Workflow state: {summary.get('workflow_state', 'unknown')}",
         f"Verification state: {summary.get('verification_state', 'unknown')}",
         f"Memory state: {summary.get('memory_state', 'unknown')}",
+        f"Shared memory state: {summary.get('shared_memory_state', 'unknown')}",
+        "Memory candidates: "
+        f"{summary.get('memory_candidates_pending', 0)} "
+        f"({summary.get('memory_candidates_state', 'unknown')})",
+        f"Memory sync state: {summary.get('memory_sync_state', 'unknown')}",
         f"Policy state: {summary.get('policy_state', 'unknown')}",
         f"Risk level: {summary.get('risk_level', 'unknown')}",
     ]
-    if summary.get("task_state_mode") == "streams":
-        lines.append(
-            "Streams: "
-            f"{summary.get('task_stream_count', 0)} total, "
-            f"{summary.get('open_task_stream_count', 0)} open, "
-            f"primary={summary.get('primary_stream_id') or 'none'}"
-        )
 
     if summary["blockers"]:
         lines.append("Blockers:")
@@ -227,6 +235,10 @@ def main() -> int:
             "workflow_state": "unknown",
             "verification_state": "unknown",
             "memory_state": "unknown",
+            "shared_memory_state": "unknown",
+            "memory_candidates_state": "unknown",
+            "memory_candidates_pending": 0,
+            "memory_sync_state": "unknown",
             "policy_state": "unknown",
             "verification_summary": {},
             "change_scope": {},
